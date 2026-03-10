@@ -34,3 +34,33 @@ input_images*/
 src/debug_main.py
 temp*.png
 /outputs
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+#
+# # datasets
+datasets/
+#
+# # outputs
+output/
+output_*
+dryrun_output/
+#
+# # images
+*.png
+*.jpg
+*.jpeg
+#
+# # checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# # logs
+wandb/
+logs/
+
+# # misc
+.ipynb_checkpoints

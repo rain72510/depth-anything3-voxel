@@ -38,6 +38,9 @@ from depth_anything_3.utils.io.output_processor import OutputProcessor
 from depth_anything_3.utils.logger import logger
 from depth_anything_3.utils.pose_align import align_poses_umeyama
 
+from .voxelizer import BoundedVoxelizer
+from .sparse_voxelizer import SparseVoxelizer
+
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
 
@@ -211,6 +214,36 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         )
 
         # Convert raw output to prediction
+
+        for key, value in raw_output.items():
+            if isinstance(value, torch.Tensor):
+                print(f"Raw output field '{key}': shape {value.shape}, dtype {value.dtype}")
+            else:
+                print(f"Raw output field '{key}': type {type(value)}")
+        
+        # Raw output field 'feats': type <class 'tuple'>
+        # print the shape and dtype of each element in feats if it's a tuple of tensors
+        if 'feats' in raw_output and isinstance(raw_output['feats'], tuple):
+            for i, feat in enumerate(raw_output['feats']):
+                if isinstance(feat, torch.Tensor):
+                    print(f"  Feat {i}: shape {feat.shape}, dtype {feat.dtype}")
+                else:
+                    print(f"  Feat {i}: type {type(feat)}")
+
+        # print the shape and dtype of each element in feats if it's a tuple of tensors
+        if 'feats' in raw_output and isinstance(raw_output['feats'], tuple):
+            for i, feat_tuple in enumerate(raw_output['feats']):
+                if isinstance(feat_tuple, tuple):
+                    for j, feat in enumerate(feat_tuple):
+                        if isinstance(feat, torch.Tensor):
+                            print(f"  Feat {i}-{j}: shape {feat.shape}, dtype {feat.dtype}")
+                        else:
+                            print(f"  Feat {i}-{j}: type {type(feat)}")
+                else:
+                    print(f"  Feat {i}: type {type(feat_tuple)}")
+
+        print(raw_output.aux.keys())
+
         prediction = self._convert_to_prediction(raw_output)
 
         # Align prediction to extrinsincs
@@ -220,6 +253,26 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # Add processed images for visualization
         prediction = self._add_processed_images(prediction, imgs_cpu)
+
+        # prediction is a dictionary
+        # print prediction 各欄位的 shape
+        for key, value in prediction.__dict__.items():
+            if isinstance(value, np.ndarray):
+                print(f"Prediction field '{key}': shape {value.shape}, dtype {value.dtype}")
+            else:
+                print(f"Prediction field '{key}': type {type(value)}")
+
+        print(type(prediction.gaussians))
+        print(prediction.gaussians)
+        print(vars(prediction.gaussians).keys() if hasattr(prediction.gaussians, "__dict__") else None)
+
+        prediction = self._voxelize(  
+            prediction,  
+            max_depth=getattr(self, '_voxel_max_depth', 50.0),  
+            voxel_size=getattr(self, '_voxel_size', 0.4),  
+            conf_percentile=getattr(self, '_voxel_conf_percentile', 40.0),  
+            truncation_band=getattr(self, '_voxel_truncation_band', 0.5)  
+        )  
 
         # Export if requested
         if export_dir is not None:
@@ -409,6 +462,50 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         processed_imgs = (processed_imgs * 255).astype(np.uint8)
 
         prediction.processed_images = processed_imgs
+        return prediction
+    
+    def _voxelize(  
+        self,  
+        prediction: Prediction,  
+        max_depth: float = 50.0,  
+        voxel_size: float = 0.2,  
+        conf_percentile: float = 30.0,  
+        truncation_band: float = 0.3,  
+    ) -> Prediction:  
+        """  
+        Voxelize prediction into bounded 3D voxel grid.  
+        
+        Args:  
+            prediction: DA3 prediction object  
+            max_depth: Maximum depth for bounded region (meters)  
+            voxel_size: Voxel size in meters  
+            conf_percentile: Confidence threshold percentile  
+            truncation_band: Truncation distance for depth-aware voxelization  
+            
+        Returns:  
+            Prediction object with voxelization results in aux['voxel']  
+        """  
+        start_time = time.time()
+        if not hasattr(prediction, 'aux') or prediction.aux is None:  
+            prediction.aux = {}  
+        
+        # Initialize voxelizer  
+        # voxelizer = BoundedVoxelizer(  
+        voxelizer = SparseVoxelizer(  
+            max_depth=max_depth,  
+            voxel_size=voxel_size,  
+            conf_percentile=conf_percentile,  
+            truncation_band=truncation_band  
+        )  
+        
+        # Perform voxelization  
+        voxel_results = voxelizer.voxelize_prediction(prediction)  
+        
+        # Store results in prediction.aux  
+        prediction.aux['voxel'] = voxel_results  
+        end_time = time.time()
+        logger.info(f"Voxelization Done. Time: {end_time - start_time} seconds")
+        
         return prediction
 
     def _export_results(

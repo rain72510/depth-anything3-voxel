@@ -40,6 +40,7 @@ from depth_anything_3.utils.pose_align import align_poses_umeyama
 
 from .voxelizer import BoundedVoxelizer
 from .sparse_voxelizer import SparseVoxelizer
+from .feature_aggregator import build_spatial_feature_map
 
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
@@ -253,6 +254,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # Add processed images for visualization
         prediction = self._add_processed_images(prediction, imgs_cpu)
+
+        prediction.raw_feats = raw_output.get("feats", None)
 
         # prediction is a dictionary
         # print prediction 各欄位的 shape

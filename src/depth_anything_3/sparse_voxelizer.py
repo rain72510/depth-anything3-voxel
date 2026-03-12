@@ -2,18 +2,32 @@ import torch
 import time
 from typing import Optional, Tuple, Dict, Any
 
+def build_decoder_inputs(voxel_dict, device):
+    return {
+        "anchor_xyz": voxel_dict["voxel_mean_points"].to(device),   # [K, 3]
+        "dino_feat": voxel_dict["voxel_features"].to(device),       # [K, C]
+        "confidence": voxel_dict["voxel_confidence"].to(device),    # [K]
+        "cov_diag": voxel_dict["voxel_var_points"].to(device),      # [K, 3]
+    }
+
 class SparseVoxelizer:
     def __init__(
         self,
         max_depth: float = 50.0,
         voxel_size: float = 0.4, # 建議自駕場景從 0.4m 開始
         conf_percentile: float = 30.0,
-        truncation_band: float = 0.5  
+        truncation_band: float = 0.5,
+        feat_mode: str = "last2_avg",      # "last", "last2_avg", "all4_avg"
+        patch_size: int = 14,
+        feat_dim_out: Optional[int] = None # e.g. 256; None means keep original dim
     ):
         self.max_depth = max_depth
         self.voxel_size = voxel_size
         self.conf_percentile = conf_percentile
         self.truncation_band = truncation_band 
+        self.feat_mode = feat_mode
+        self.patch_size = patch_size
+        self.feat_dim_out = feat_dim_out
 
     @torch.no_grad()
     def voxelize_prediction(self, prediction: Any) -> Dict[str, Any]:
@@ -29,6 +43,8 @@ class SparseVoxelizer:
         print(f"Extrinsics[0]: {extrinsics[0]}")
         print(f"Intrinsics[0]: {intrinsics[0]}")
 
+        raw_feats = getattr(prediction, "raw_feats", None)
+
         # 2. 計算 Mask
         mask = torch.isfinite(depth) & (depth > 0) & (depth < self.max_depth)
         if conf is not None:
@@ -37,17 +53,20 @@ class SparseVoxelizer:
             mask &= (conf >= conf_thresh)
 
         # 3. 反投影
-        world_points, view_ids = self._unproject_vectorized(depth, intrinsics, extrinsics, mask)
+        world_points, view_ids, ys, xs = self._unproject_vectorized(depth, intrinsics, extrinsics, mask)
 
         if world_points.shape[0] == 0:
             return {"num_voxels": 0}
-
+        
         # 4. Voxelization
         voxel_coords = torch.floor(world_points / self.voxel_size).long()
         unique_voxels, inverse_indices = torch.unique(voxel_coords, dim=0, return_inverse=True)
 
         num_unique = unique_voxels.shape[0]
         num_points = world_points.shape[0]
+
+        voxel_features = None
+        voxel_feature_dim = None
 
         # ---------------------------------------------------
         # A. 每個 voxel 的 point count
@@ -108,6 +127,20 @@ class SparseVoxelizer:
             torch.ones(unique_voxel_view_pairs.shape[0], device=device, dtype=torch.long)
         )
 
+        if raw_feats is not None:
+            voxel_features = self._aggregate_voxel_features_from_tokens_chunked(
+                raw_feats=raw_feats,
+                view_ids=view_ids,
+                ys=ys,
+                xs=xs,
+                inverse_indices=inverse_indices,
+                voxel_point_counts=voxel_point_counts,
+                image_hw=depth.shape[-2:],
+                device=device,
+                chunk_size=200000,   # 可調
+            )
+            voxel_feature_dim = voxel_features.shape[1]
+
         # ---------------------------------------------------
         # F. bbox
         # ---------------------------------------------------
@@ -135,6 +168,7 @@ class SparseVoxelizer:
             "bbox_min": bbox_min.tolist(),
             "bbox_max": bbox_max.tolist(),
             "bbox_extent": bbox_extent.tolist(),
+            "voxel_feature_dim": voxel_feature_dim,
         }
 
         print("Voxelization complete.")
@@ -148,6 +182,7 @@ class SparseVoxelizer:
             "voxel_mean_points": voxel_mean_points,     # (K, 3)
             "voxel_var_points": voxel_var_points,       # (K, 3)
             "voxel_view_counts": voxel_view_counts,     # (K,)
+            "voxel_features": voxel_features,           # (K, C) or None
             "num_voxels": int(num_unique),
             "num_points": int(num_points),
             "voxel_size": self.voxel_size,
@@ -156,47 +191,116 @@ class SparseVoxelizer:
             "bbox_extent": bbox_extent,
             "stats": stats,
         }
+    
+    def _aggregate_voxel_features_from_tokens_chunked(
+        self,
+        raw_feats,
+        view_ids: torch.Tensor,
+        ys: torch.Tensor,
+        xs: torch.Tensor,
+        inverse_indices: torch.Tensor,
+        voxel_point_counts: torch.Tensor,
+        image_hw: Tuple[int, int],
+        device: torch.device,
+        chunk_size: int = 200000,
+    ) -> torch.Tensor:
+        """
+        直接 chunk gather point features，並累加到 voxel_feature_sum。
+        不建立完整 [num_points, C]，避免 OOM。
+        """
+
+        # 1. choose spatial token features
+        if self.feat_mode == "last":
+            feat_tokens = raw_feats[3][0]
+        elif self.feat_mode == "last2_avg":
+            feat_tokens = 0.5 * (raw_feats[2][0] + raw_feats[3][0])
+        elif self.feat_mode == "all4_avg":
+            feat_tokens = sum(raw_feats[i][0] for i in range(4)) / 4.0
+        else:
+            raise ValueError(f"Unknown feat_mode: {self.feat_mode}")
+
+        # [1, V, Ntok, C] -> [V, Ntok, C]
+        feat_tokens = feat_tokens[0].to(device)
+
+        V, Ntok, C = feat_tokens.shape
+        H, W = image_hw
+        patch = self.patch_size
+        Hf, Wf = H // patch, W // patch
+
+        assert Ntok == Hf * Wf, f"Ntok={Ntok}, expected {Hf * Wf} from image_hw={image_hw}, patch={patch}"
+
+        # 2. optional dim truncation (先切，再 gather)
+        if self.feat_dim_out is not None and self.feat_dim_out < C:
+            feat_tokens = feat_tokens[..., :self.feat_dim_out]
+
+        # 3. half precision 節省記憶體
+        feat_tokens = feat_tokens.to(torch.float16)
+
+        C_small = feat_tokens.shape[-1]
+        num_voxels = voxel_point_counts.shape[0]
+
+        voxel_feature_sum = torch.zeros((num_voxels, C_small), device=device, dtype=feat_tokens.dtype)
+
+        num_points = view_ids.shape[0]
+
+        for start in range(0, num_points, chunk_size):
+            end = min(start + chunk_size, num_points)
+
+            view_ids_chunk = view_ids[start:end]
+            ys_chunk = ys[start:end]
+            xs_chunk = xs[start:end]
+            inv_chunk = inverse_indices[start:end]
+
+            patch_y = ys_chunk // patch
+            patch_x = xs_chunk // patch
+            token_idx = patch_y * Wf + patch_x   # [chunk]
+
+            # [chunk, C_small]
+            point_feat_chunk = feat_tokens[view_ids_chunk, token_idx]
+
+            voxel_feature_sum.index_add_(0, inv_chunk, point_feat_chunk)
+
+            # 可選，幫助釋放暫時 tensor
+            del view_ids_chunk, ys_chunk, xs_chunk, inv_chunk, token_idx, point_feat_chunk
+
+        voxel_features = voxel_feature_sum / voxel_point_counts.unsqueeze(-1).clamp_min(1).to(voxel_feature_sum.dtype)
+        return voxel_features
 
     def _unproject_vectorized(self, depth, K, E, mask):
         N, H, W = depth.shape
         device = depth.device
 
-        v, u = torch.meshgrid(
-            torch.arange(H, device=device),
-            torch.arange(W, device=device),
-            indexing='ij'
-        )
-
-        valid_coords = torch.nonzero(mask, as_tuple=False)   # (M, 3) = [view, v, u]
+        valid_coords = torch.nonzero(mask, as_tuple=False)   # (M, 3) = [view, y, x]
         if valid_coords.numel() == 0:
-            return torch.empty((0, 3), device=device, dtype=depth.dtype)
+            empty_xyz = torch.empty((0, 3), device=device, dtype=depth.dtype)
+            empty_idx = torch.empty((0,), device=device, dtype=torch.long)
+            return empty_xyz, empty_idx, empty_idx, empty_idx
 
         view_ids = valid_coords[:, 0]
-        v_m = valid_coords[:, 1].float()
-        u_m = valid_coords[:, 2].float()
-        z = depth[view_ids, valid_coords[:, 1], valid_coords[:, 2]]  # (M,)
+        ys = valid_coords[:, 1]
+        xs = valid_coords[:, 2]
 
-        # homogeneous image coords
-        homo_coords = torch.stack([u_m, v_m, torch.ones_like(u_m)], dim=-1)  # (M, 3)
+        y_f = ys.float()
+        x_f = xs.float()
+        z = depth[view_ids, ys, xs]
 
-        # per-view inverse intrinsics
-        inv_K = torch.inverse(K)                    # (N, 3, 3)
-        inv_K_sel = inv_K[view_ids]                 # (M, 3, 3)
+        homo_coords = torch.stack([x_f, y_f, torch.ones_like(x_f)], dim=-1)
 
-        # camera-space points
-        points_cam = torch.bmm(inv_K_sel, homo_coords.unsqueeze(-1)).squeeze(-1)  # (M, 3)
+        inv_K = torch.inverse(K)
+        inv_K_sel = inv_K[view_ids]
+
+        points_cam = torch.bmm(inv_K_sel, homo_coords.unsqueeze(-1)).squeeze(-1)
         points_cam = points_cam * z.unsqueeze(-1)
 
-        # convert E -> c2w
-        E_h = self._as_homogeneous_batch(E)         # (N, 4, 4)
-        c2w = torch.inverse(E_h)                    # (N, 4, 4)
-        c2w_sel = c2w[view_ids]                     # (M, 4, 4)
+        E_h = self._as_homogeneous_batch(E)
+        c2w = torch.inverse(E_h)
+        c2w_sel = c2w[view_ids]
 
-        R = c2w_sel[:, :3, :3]                      # (M, 3, 3)
-        t = c2w_sel[:, :3, 3]                       # (M, 3)
+        R = c2w_sel[:, :3, :3]
+        t = c2w_sel[:, :3, 3]
 
         points_world = torch.bmm(R, points_cam.unsqueeze(-1)).squeeze(-1) + t
-        return points_world, view_ids
+        return points_world, view_ids, ys, xs
     
     def _as_homogeneous_batch(self, E):
         # E: (N, 3, 4)

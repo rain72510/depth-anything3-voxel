@@ -2,14 +2,6 @@ import torch
 import time
 from typing import Optional, Tuple, Dict, Any
 
-def build_decoder_inputs(voxel_dict, device):
-    return {
-        "anchor_xyz": voxel_dict["voxel_mean_points"].to(device),   # [K, 3]
-        "dino_feat": voxel_dict["voxel_features"].to(device),       # [K, C]
-        "confidence": voxel_dict["voxel_confidence"].to(device),    # [K]
-        "cov_diag": voxel_dict["voxel_var_points"].to(device),      # [K, 3]
-    }
-
 class SparseVoxelizer:
     def __init__(
         self,
@@ -23,6 +15,7 @@ class SparseVoxelizer:
     ):
         self.max_depth = max_depth
         self.voxel_size = voxel_size
+        # self.voxel_size = 0.1
         self.conf_percentile = conf_percentile
         self.truncation_band = truncation_band 
         self.feat_mode = feat_mode
@@ -40,8 +33,8 @@ class SparseVoxelizer:
         images = torch.from_numpy(prediction.processed_images).to(device) if prediction.processed_images is not None else None
         conf = torch.from_numpy(prediction.conf).to(device) if prediction.conf is not None else None
 
-        print(f"Extrinsics[0]: {extrinsics[0]}")
-        print(f"Intrinsics[0]: {intrinsics[0]}")
+        # print(f"Extrinsics[0]: {extrinsics[0]}")
+        # print(f"Intrinsics[0]: {intrinsics[0]}")
 
         raw_feats = getattr(prediction, "raw_feats", None)
 
@@ -114,6 +107,13 @@ class SparseVoxelizer:
 
             voxel_colors = color_sum / color_count.clamp_min(1e-6)
 
+        point_conf = conf[view_ids, ys, xs].float()   # [num_points]
+
+        voxel_conf_sum = torch.zeros(num_unique, device=device, dtype=torch.float32)
+        voxel_conf_sum.index_add_(0, inverse_indices, point_conf)
+
+        voxel_confidence = voxel_conf_sum / voxel_point_counts.clamp_min(1).float()
+
         # ---------------------------------------------------
         # E. 每個 voxel 的 unique view count
         # ---------------------------------------------------
@@ -172,8 +172,13 @@ class SparseVoxelizer:
         }
 
         print("Voxelization complete.")
-        for k, v in stats.items():
-            print(f"{k}: {v}")
+        # for k, v in stats.items():
+        #     print(f"{k}: {v}")
+
+        # # print voxel_features min, max, mean
+        # if voxel_features is not None:
+        #     print(f"voxel_features: min={voxel_features.min().item()}, max={voxel_features.max().item()}, mean={voxel_features.mean().item()}")
+
 
         return {
             "voxel_indices": unique_voxels,             # (K, 3)
@@ -183,6 +188,7 @@ class SparseVoxelizer:
             "voxel_var_points": voxel_var_points,       # (K, 3)
             "voxel_view_counts": voxel_view_counts,     # (K,)
             "voxel_features": voxel_features,           # (K, C) or None
+            "voxel_confidence": voxel_confidence,
             "num_voxels": int(num_unique),
             "num_points": int(num_points),
             "voxel_size": self.voxel_size,
@@ -236,10 +242,14 @@ class SparseVoxelizer:
         # 3. half precision 節省記憶體
         feat_tokens = feat_tokens.to(torch.float16)
 
+        # print feat_tokens min, max, mean before aggregation
+        # print(f"[before aggregation] feat_tokens: min={feat_tokens.min().item()}, max={feat_tokens.max().item()}, mean={feat_tokens.mean().item()}")
+
         C_small = feat_tokens.shape[-1]
         num_voxels = voxel_point_counts.shape[0]
 
-        voxel_feature_sum = torch.zeros((num_voxels, C_small), device=device, dtype=feat_tokens.dtype)
+        # voxel_feature_sum = torch.zeros((num_voxels, C_small), device=device, dtype=feat_tokens.dtype)
+        voxel_feature_sum = torch.zeros((num_voxels, C_small), device=device, dtype=torch.float32)  # 用 float32 累加，減少精度損失
 
         num_points = view_ids.shape[0]
 
@@ -256,14 +266,22 @@ class SparseVoxelizer:
             token_idx = patch_y * Wf + patch_x   # [chunk]
 
             # [chunk, C_small]
-            point_feat_chunk = feat_tokens[view_ids_chunk, token_idx]
+            point_feat_chunk = feat_tokens[view_ids_chunk, token_idx].to(torch.float32)
 
             voxel_feature_sum.index_add_(0, inv_chunk, point_feat_chunk)
 
             # 可選，幫助釋放暫時 tensor
             del view_ids_chunk, ys_chunk, xs_chunk, inv_chunk, token_idx, point_feat_chunk
 
-        voxel_features = voxel_feature_sum / voxel_point_counts.unsqueeze(-1).clamp_min(1).to(voxel_feature_sum.dtype)
+        # print voxel_feature_sum min, max, mean
+        # in func _aggregate_voxel_features_from_tokens_chunked, after the for loop
+        # print(f"[in func _aggregate_voxel_features_from_tokens_chunked] voxel_feature_sum: min={voxel_feature_sum.min().item()}, max={voxel_feature_sum.max().item()}, mean={voxel_feature_sum.mean().item()}")
+
+        # print voxel_point_counts min, max, mean
+        # print(f"voxel_point_counts: min={voxel_point_counts.min().item()}, max={voxel_point_counts.max().item()}, mean={voxel_point_counts.float().mean().item()}")
+
+        voxel_counts = voxel_point_counts.unsqueeze(-1).clamp_min(1).to(torch.float32)
+        voxel_features = voxel_feature_sum / voxel_counts
         return voxel_features
 
     def _unproject_vectorized(self, depth, K, E, mask):

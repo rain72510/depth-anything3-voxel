@@ -3,6 +3,7 @@ import os
 import numpy as np  
 import trimesh  
 from typing import Optional, Dict, Any  
+import time
   
 from ...specs import Prediction  
 from ...voxelizer import BoundedVoxelizer  
@@ -29,6 +30,8 @@ def export_voxel_centers_glb(
     Returns:  
         Path to exported GLB file  
     """  
+    starttime = time.time()
+    print("Exporting voxel centers as GLB...")
     # Initialize voxelizer with provided config  
     voxelizer_cfg = voxelizer_cfg or {}  
     # voxelizer = BoundedVoxelizer(**voxelizer_cfg)  
@@ -81,5 +84,6 @@ def export_voxel_centers_glb(
     # Export as GLB  
     output_path = os.path.join(export_dir, filename)  
     point_cloud.export(output_path)  
+    print(f"Exported GLB to {output_path} (took {time.time() - starttime:.2f}s)")
       
     return output_path

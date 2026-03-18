@@ -56,7 +56,7 @@ class VoxelGaussianDecoder(nn.Module):
     Outputs:
         - centers:           [N, K, 3]
         - offsets:           [N, K, 3]
-        - anchor_scale:      [N, 1]
+        - anchor_scale:      [N, 3]
         - scales:            [N, K, 3]
         - quaternions:       [N, K, 4]
         - opacity:           [N, K, 1]
@@ -124,23 +124,15 @@ class VoxelGaussianDecoder(nn.Module):
         self.anchor_scale_head = MLP(
             in_dim=hidden_dim,
             hidden_dim=hidden_dim,
-            out_dim=1,
+            out_dim=6,
             num_layers=2,
             activation=nn.ReLU,
         )
 
-        self.scale_head = MLP(
+        self.cov_head = MLP(        # scale and quat
             in_dim=hidden_dim,
             hidden_dim=hidden_dim,
-            out_dim=num_gaussians * 3,
-            num_layers=2,
-            activation=nn.ReLU,
-        )
-
-        self.quat_head = MLP(
-            in_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            out_dim=num_gaussians * 4,
+            out_dim=num_gaussians * 7,
             num_layers=2,
             activation=nn.ReLU,
         )
@@ -225,6 +217,22 @@ class VoxelGaussianDecoder(nn.Module):
         cov_diag:   [N, 3]
         camera_xyz: [N, 3] or [1, 3], optional if use_view_conditioning=False
         """
+
+        def check_tensor(name, x):
+            print(
+                f"{name}: shape={tuple(x.shape)}, "
+                f"nan={torch.isnan(x).any().item()}, "
+                f"inf={torch.isinf(x).any().item()}, "
+                f"min={x.nan_to_num().min().item():.6f}, "
+                f"max={x.nan_to_num().max().item():.6f}, "
+                f"mean={x.nan_to_num().mean().item():.6f}"
+            )
+        
+        # check_tensor("anchor_xyz", anchor_xyz)
+        # check_tensor("dino_feat", dino_feat)
+        # check_tensor("confidence", confidence)
+        # check_tensor("cov_diag", cov_diag)
+
         N = anchor_xyz.shape[0]
         K = self.num_gaussians
 
@@ -245,18 +253,22 @@ class VoxelGaussianDecoder(nn.Module):
         delta_offsets = self.offset_head(h).view(N, K, 3)          # [N, K, 3]
         offsets = self.offset_template.unsqueeze(0) + delta_offsets
 
-        anchor_scale_raw = self.anchor_scale_head(h)               # [N, 1]
-        anchor_scale = F.softplus(anchor_scale_raw) + 1e-4         # positive
+        anchor_scale_raw = self.anchor_scale_head(h)               # [N, 6]
+        anchor_scale = F.softplus(anchor_scale_raw) + 1e-4   # [N, 6]
+        offset_scale = anchor_scale[:, :3]
+        gaussian_base_scale = anchor_scale[:, 3:]
 
-        scale_raw = self.scale_head(h).view(N, K, 3)               # [N, K, 3]
-        scales = F.softplus(
-            self.scale_template.unsqueeze(0) + scale_raw
-        ) + 1e-4                                                   # positive
+        cov_raw = self.cov_head(h).view(N, K, 7)
+        scale_raw = cov_raw[..., :3]
+        quat_raw  = cov_raw[..., 3:7]
 
-        quat_raw = self.quat_head(h).view(N, K, 4)                 # [N, K, 4]
+        # scale_raw = self.scale_head(h).view(N, K, 3)               # [N, K, 3]
+        scales = gaussian_base_scale[:, None, :] * torch.sigmoid(scale_raw) + 1e-4
+
+        # quat_raw = self.quat_head(h).view(N, K, 4)                 # [N, K, 4]
         quaternions = normalize_quaternion(quat_raw)
 
-        centers = anchor_xyz.unsqueeze(1) + anchor_scale.unsqueeze(1) * offsets
+        centers = anchor_xyz[:, None, :] + offsets * offset_scale[:, None, :]
 
         # ---------------------------------------------
         # Appearance heads
@@ -281,6 +293,13 @@ class VoxelGaussianDecoder(nn.Module):
             colors = torch.tanh(color_raw)
         else:
             colors = color_raw
+
+        # print statistics for debugging
+        # print(f"offsets: {offsets.mean().item():.4f} ± {offsets.std().item():.4f}")
+        # print(f"scales: {scales.mean().item():.4f} ± {scales.std().item():.4f}")
+        # print(f"quaternions: {quaternions.mean().item():.4f} ± {quaternions.std().item():.4f}")
+        # print(f"opacity: {opacity.mean().item():.4f} ± {opacity.std().item():.4f}")
+        # print(f"colors: {colors.mean().item():.4f} ± {colors.std().item():.4f}")
 
         return {
             "centers": centers,             # [N, K, 3]

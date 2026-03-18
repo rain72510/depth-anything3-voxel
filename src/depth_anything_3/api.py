@@ -29,6 +29,7 @@ from huggingface_hub import PyTorchModelHubMixin
 from PIL import Image
 
 from depth_anything_3.cfg import create_object, load_config
+from depth_anything_3.model.voxel_to_gaussian_model import VoxelToGaussianModel
 from depth_anything_3.registry import MODEL_REGISTRY
 from depth_anything_3.specs import Prediction
 from depth_anything_3.utils.export import export
@@ -40,6 +41,7 @@ from depth_anything_3.utils.pose_align import align_poses_umeyama
 
 from .voxelizer import BoundedVoxelizer
 from .sparse_voxelizer import SparseVoxelizer
+from .model.voxel_gaussian_decoder import VoxelGaussianDecoder
 
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
@@ -215,34 +217,34 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # Convert raw output to prediction
 
-        for key, value in raw_output.items():
-            if isinstance(value, torch.Tensor):
-                print(f"Raw output field '{key}': shape {value.shape}, dtype {value.dtype}")
-            else:
-                print(f"Raw output field '{key}': type {type(value)}")
+        # for key, value in raw_output.items():
+        #     if isinstance(value, torch.Tensor):
+        #         print(f"Raw output field '{key}': shape {value.shape}, dtype {value.dtype}")
+        #     else:
+        #         print(f"Raw output field '{key}': type {type(value)}")
         
-        # Raw output field 'feats': type <class 'tuple'>
-        # print the shape and dtype of each element in feats if it's a tuple of tensors
-        if 'feats' in raw_output and isinstance(raw_output['feats'], tuple):
-            for i, feat in enumerate(raw_output['feats']):
-                if isinstance(feat, torch.Tensor):
-                    print(f"  Feat {i}: shape {feat.shape}, dtype {feat.dtype}")
-                else:
-                    print(f"  Feat {i}: type {type(feat)}")
+        # # Raw output field 'feats': type <class 'tuple'>
+        # # print the shape and dtype of each element in feats if it's a tuple of tensors
+        # if 'feats' in raw_output and isinstance(raw_output['feats'], tuple):
+        #     for i, feat in enumerate(raw_output['feats']):
+        #         if isinstance(feat, torch.Tensor):
+        #             print(f"  Feat {i}: shape {feat.shape}, dtype {feat.dtype}")
+        #         else:
+        #             print(f"  Feat {i}: type {type(feat)}")
 
-        # print the shape and dtype of each element in feats if it's a tuple of tensors
-        if 'feats' in raw_output and isinstance(raw_output['feats'], tuple):
-            for i, feat_tuple in enumerate(raw_output['feats']):
-                if isinstance(feat_tuple, tuple):
-                    for j, feat in enumerate(feat_tuple):
-                        if isinstance(feat, torch.Tensor):
-                            print(f"  Feat {i}-{j}: shape {feat.shape}, dtype {feat.dtype}")
-                        else:
-                            print(f"  Feat {i}-{j}: type {type(feat)}")
-                else:
-                    print(f"  Feat {i}: type {type(feat_tuple)}")
+        # # print the shape and dtype of each element in feats if it's a tuple of tensors
+        # if 'feats' in raw_output and isinstance(raw_output['feats'], tuple):
+        #     for i, feat_tuple in enumerate(raw_output['feats']):
+        #         if isinstance(feat_tuple, tuple):
+        #             for j, feat in enumerate(feat_tuple):
+        #                 if isinstance(feat, torch.Tensor):
+        #                     print(f"  Feat {i}-{j}: shape {feat.shape}, dtype {feat.dtype}")
+        #                 else:
+        #                     print(f"  Feat {i}-{j}: type {type(feat)}")
+        #         else:
+        #             print(f"  Feat {i}: type {type(feat_tuple)}")
 
-        print(raw_output.aux.keys())
+        # print(raw_output.aux.keys())
 
         prediction = self._convert_to_prediction(raw_output)
 
@@ -258,23 +260,46 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # prediction is a dictionary
         # print prediction 各欄位的 shape
-        for key, value in prediction.__dict__.items():
-            if isinstance(value, np.ndarray):
-                print(f"Prediction field '{key}': shape {value.shape}, dtype {value.dtype}")
-            else:
-                print(f"Prediction field '{key}': type {type(value)}")
+        # for key, value in prediction.__dict__.items():
+        #     if isinstance(value, np.ndarray):
+        #         print(f"Prediction field '{key}': shape {value.shape}, dtype {value.dtype}")
+        #     else:
+        #         print(f"Prediction field '{key}': type {type(value)}")
 
-        print(type(prediction.gaussians))
-        print(prediction.gaussians)
-        print(vars(prediction.gaussians).keys() if hasattr(prediction.gaussians, "__dict__") else None)
+        # print(type(prediction.gaussians))
+        # print(prediction.gaussians)
+        # print(vars(prediction.gaussians).keys() if hasattr(prediction.gaussians, "__dict__") else None)
+        # print all the shape of the fields in prediction.gaussians if it's a dataclass with tensor fields
+        # if hasattr(prediction.gaussians, "__dict__"):
+        #     for key, value in prediction.gaussians.__dict__.items():
+        #         if isinstance(value, torch.Tensor):
+        #             print(f"Gaussians field '{key}': shape {value.shape}, dtype {value.dtype}")
+        #         else:
+        #             print(f"Gaussians field '{key}': type {type(value)}")
 
-        prediction = self._voxelize(  
-            prediction,  
-            max_depth=getattr(self, '_voxel_max_depth', 50.0),  
-            voxel_size=getattr(self, '_voxel_size', 0.4),  
-            conf_percentile=getattr(self, '_voxel_conf_percentile', 40.0),  
-            truncation_band=getattr(self, '_voxel_truncation_band', 0.5)  
-        )  
+        # prediction = self._voxelize(  
+        #     prediction,  
+        #     max_depth=getattr(self, '_voxel_max_depth', 50.0),  
+        #     voxel_size=getattr(self, '_voxel_size', 0.4),  
+        #     conf_percentile=getattr(self, '_voxel_conf_percentile', 40.0),  
+        #     truncation_band=getattr(self, '_voxel_truncation_band', 0.5)  
+        # )  
+
+        # voxel_dict = prediction.aux['voxel']
+
+        # voxel_feature_dim = 128
+        # device = self._get_model_device()
+
+        # decoder = VoxelGaussianDecoder(
+        #     dino_dim=voxel_feature_dim,
+        #     hidden_dim=256,
+        #     num_gaussians=4,
+        #     use_view_conditioning=False,
+        # ).to(device)
+
+        # voxel_to_gaussian_model = VoxelToGaussianModel(decoder).to(device)
+
+        return prediction
 
         # Export if requested
         if export_dir is not None:
@@ -345,12 +370,12 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             process_res_method,
         )
         end_time = time.time()
-        logger.info(
-            "Processed Images Done taking",
-            end_time - start_time,
-            "seconds. Shape: ",
-            imgs_cpu.shape,
-        )
+        # logger.info(
+        #     "Processed Images Done taking",
+        #     end_time - start_time,
+        #     "seconds. Shape: ",
+        #     imgs_cpu.shape,
+        # )
         return imgs_cpu, extrinsics, intrinsics
 
     def _prepare_model_inputs(
@@ -402,6 +427,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         ransac_view_thresh: int = 10,
     ) -> Prediction:
         """Align depth map to input extrinsics"""
+        start_time = time.time()
         if extrinsics is None:
             return prediction
         prediction.intrinsics = intrinsics.numpy()
@@ -417,6 +443,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             prediction.depth /= scale
         else:
             prediction.extrinsics = aligned_extrinsics
+        end_time = time.time()
+        # logger.info(f"Aligned to Input Extrinsics Done. Time: {end_time - start_time} seconds")
         return prediction
 
     def _run_model_forward(
@@ -440,7 +468,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         if need_sync:
             torch.cuda.synchronize(device)
         end_time = time.time()
-        logger.info(f"Model Forward Pass Done. Time: {end_time - start_time} seconds")
+        # logger.info(f"Model Forward Pass Done. Time: {end_time - start_time} seconds")
         return output
 
     def _convert_to_prediction(self, raw_output: dict[str, torch.Tensor]) -> Prediction:
@@ -448,12 +476,13 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         start_time = time.time()
         output = self.output_processor(raw_output)
         end_time = time.time()
-        logger.info(f"Conversion to Prediction Done. Time: {end_time - start_time} seconds")
+        # logger.info(f"Conversion to Prediction Done. Time: {end_time - start_time} seconds")
         return output
 
     def _add_processed_images(self, prediction: Prediction, imgs_cpu: torch.Tensor) -> Prediction:
         """Add processed images to prediction for visualization."""
         # Convert from (N, 3, H, W) to (N, H, W, 3) and denormalize
+        start_time = time.time()
         processed_imgs = imgs_cpu.permute(0, 2, 3, 1).cpu().numpy()  # (N, H, W, 3)
 
         # Denormalize from ImageNet normalization
@@ -464,6 +493,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         processed_imgs = (processed_imgs * 255).astype(np.uint8)
 
         prediction.processed_images = processed_imgs
+        end_time = time.time()
+        # logger.info(f"Added Processed Images to Prediction. Time: {end_time - start_time} seconds")
         return prediction
     
     def _voxelize(  
@@ -497,7 +528,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             max_depth=max_depth,  
             voxel_size=voxel_size,  
             conf_percentile=conf_percentile,  
-            truncation_band=truncation_band  
+            truncation_band=truncation_band,
+            feat_dim_out=128,
         )  
         
         # Perform voxelization  
@@ -506,7 +538,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         # Store results in prediction.aux  
         prediction.aux['voxel'] = voxel_results  
         end_time = time.time()
-        logger.info(f"Voxelization Done. Time: {end_time - start_time} seconds")
+        # logger.info(f"Voxelization Done. Time: {end_time - start_time} seconds")
         
         return prediction
 
@@ -517,7 +549,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         start_time = time.time()
         export(prediction, export_format, export_dir, **kwargs)
         end_time = time.time()
-        logger.info(f"Export Results Done. Time: {end_time - start_time} seconds")
+        # logger.info(f"Export Results Done. Time: {end_time - start_time} seconds")
 
     def _get_model_device(self) -> torch.device:
         """

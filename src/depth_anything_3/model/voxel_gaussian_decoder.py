@@ -66,9 +66,12 @@ class VoxelGaussianDecoder(nn.Module):
     def __init__(
         self,
         dino_dim: int,
-        hidden_dim: int = 256,
+        hidden_dim: int = 32,
         num_gaussians: int = 4,
+        use_confidence: bool = True,
+        use_cov_diag: bool = True,
         use_view_conditioning: bool = True,
+        use_distance: bool = True,
         color_act: str = "sigmoid",
     ):
         super().__init__()
@@ -76,25 +79,37 @@ class VoxelGaussianDecoder(nn.Module):
         self.dino_dim = dino_dim
         self.hidden_dim = hidden_dim
         self.num_gaussians = num_gaussians
-        self.use_view_conditioning = use_view_conditioning
         self.color_act = color_act
+
+        self.use_confidence = use_confidence
+        self.use_cov_diag = use_cov_diag
+        self.use_view_conditioning = use_view_conditioning
+        self.use_distance = use_distance
+        
 
         # --------------------------------------------------
         # Anchor input:
         #   dino_feat         -> F
+        #   covariance        -> 3
         #   confidence        -> 1
-        #   cov_diag          -> 3
         # total = F + 4
         # --------------------------------------------------
-        self.anchor_in_dim = dino_dim + 1 + 3
+        self.anchor_in_dim = dino_dim + 3 + 1
 
-        self.anchor_encoder = MLP(
-            in_dim=self.anchor_in_dim,
-            hidden_dim=hidden_dim,
-            out_dim=hidden_dim,
-            num_layers=3,
-            activation=nn.ReLU,
+        self.anchor_encoder = nn.Sequential(
+            nn.Linear(self.anchor_in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
         )
+
+        # --------------------------------------------------
+        # view-dependent input:
+        #   anchor_in_dim   -> h
+        #   direction       -> 3
+        #   distance        -> 1
+        # total = h + 4
+        # --------------------------------------------------
+        self.view_in_dim = hidden_dim + 3 + (1 if use_distance else 0)
 
         # --------------------------------------------------
         # Global learnable offset template, like scaffold prior
@@ -113,28 +128,16 @@ class VoxelGaussianDecoder(nn.Module):
         # --------------------------------------------------
         # Geometry heads (intrinsic, not view-dependent)
         # --------------------------------------------------
-        self.offset_head = MLP(
-            in_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            out_dim=num_gaussians * 3,
-            num_layers=2,
-            activation=nn.ReLU,
+        self.offset_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, num_gaussians * 3),
         )
 
-        self.anchor_scale_head = MLP(
-            in_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            out_dim=6,
-            num_layers=2,
-            activation=nn.ReLU,
-        )
-
-        self.cov_head = MLP(        # scale and quat
-            in_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            out_dim=num_gaussians * 7,
-            num_layers=2,
-            activation=nn.ReLU,
+        self.scaling_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 6),  # 3 for anchor scale, 3 for gaussian base scale
         )
 
         # --------------------------------------------------
@@ -144,23 +147,26 @@ class VoxelGaussianDecoder(nn.Module):
         # else:
         #   input = anchor_latent
         # --------------------------------------------------
-        self.view_feat_dim = 5  # (dir_x, dir_y, dir_z, log_dist, inv_dist)
-        app_in_dim = hidden_dim + self.view_feat_dim if use_view_conditioning else hidden_dim
+        # self.view_feat_dim = 5  # (dir_x, dir_y, dir_z, log_dist, inv_dist)
+        # app_in_dim = hidden_dim + self.view_feat_dim if use_view_conditioning else hidden_dim
 
-        self.opacity_head = MLP(
-            in_dim=app_in_dim,
-            hidden_dim=hidden_dim,
-            out_dim=num_gaussians * 1,
-            num_layers=2,
-            activation=nn.ReLU,
+        self.cov_mlp = nn.Sequential(
+            nn.Linear(self.view_in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, num_gaussians * 7),  # 3 scale + 4 quat
         )
 
-        self.color_head = MLP(
-            in_dim=app_in_dim,
-            hidden_dim=hidden_dim,
-            out_dim=num_gaussians * 3,
-            num_layers=2,
-            activation=nn.ReLU,
+        self.opacity_mlp = nn.Sequential(
+            nn.Linear(self.view_in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, num_gaussians),
+            nn.Tanh(),
+        )
+
+        self.color_mlp = nn.Sequential(
+            nn.Linear(self.view_in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, num_gaussians * 3),
         )
 
     def _build_anchor_input(
@@ -179,8 +185,9 @@ class VoxelGaussianDecoder(nn.Module):
 
         return torch.cat([dino_feat, confidence, cov_diag], dim=-1)
 
-    def _build_view_feature(
+    def _build_view_feature_old(
         self,
+        feature: torch.Tensor,
         anchor_xyz: torch.Tensor,
         camera_xyz: torch.Tensor,
         eps: float = 1e-6,
@@ -200,7 +207,32 @@ class VoxelGaussianDecoder(nn.Module):
         view_dir = vec / dist
         log_dist = dist.log()
         inv_dist = 1.0 / dist
-        return torch.cat([view_dir, log_dist, inv_dist], dim=-1)
+        return torch.cat([feature, view_dir, log_dist, inv_dist], dim=-1)
+    
+    def _build_view_feature(
+        self,
+        feature: torch.Tensor,
+        anchor_xyz: torch.Tensor,
+        camera_xyz: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """
+        anchor_xyz: [N, 3]
+        camera_xyz: [N, 3] or [1, 3]
+
+        Returns:
+            [N, 5] = [view_dir(3), log_dist(1), inv_dist(1)]
+        """
+        # print(f"anchor_xyz: shape={tuple(anchor_xyz.shape)}, nan={torch.isnan(anchor_xyz).any().item()}, inf={torch.isinf(anchor_xyz).any().item()}, min={anchor_xyz.nan_to_num().min().item():.6f}, max={anchor_xyz.nan_to_num().max().item():.6f}, mean={anchor_xyz.nan_to_num().mean().item():.6f}")
+        # print(f"camera_xyz: shape={tuple(camera_xyz.shape)}, nan={torch.isnan(camera_xyz).any().item()}, inf={torch.isinf(camera_xyz).any().item()}, min={camera_xyz.nan_to_num().min().item():.6f}, max={camera_xyz.nan_to_num().max().item():.6f}, mean={camera_xyz.nan_to_num().mean().item():.6f}")
+        if camera_xyz.shape[0] == 1 and anchor_xyz.shape[0] > 1:
+            camera_xyz = camera_xyz.expand(anchor_xyz.shape[0], -1)
+
+        vec = anchor_xyz - camera_xyz
+        dist = vec.norm(dim=-1, keepdim=True).clamp_min(eps)
+        view_dir = vec / dist
+        log_dist = dist.log()
+        return torch.cat([feature,view_dir, log_dist], dim=-1)
 
     def forward(
         self,
@@ -246,22 +278,32 @@ class VoxelGaussianDecoder(nn.Module):
         )  # [N, F+4]
 
         h = self.anchor_encoder(anchor_input)  # [N, H]
+        if self.use_view_conditioning:
+            if camera_xyz is None:
+                raise ValueError(
+                    "camera_xyz must be provided when use_view_conditioning=True"
+                )
+            view_feat = self._build_view_feature(h, anchor_xyz, camera_xyz)  # [N, F+8]
 
         # ---------------------------------------------
         # Geometry heads (intrinsic)
         # ---------------------------------------------
-        delta_offsets = self.offset_head(h).view(N, K, 3)          # [N, K, 3]
+        delta_offsets = self.offset_mlp(h).view(N, K, 3)          # [N, K, 3]
         offsets = self.offset_template.unsqueeze(0) + delta_offsets
 
-        anchor_scale_raw = self.anchor_scale_head(h)               # [N, 6]
+        anchor_scale_raw = self.scaling_mlp(h)               # [N, 6]
         anchor_scale = F.softplus(anchor_scale_raw) + 1e-4   # [N, 6]
         offset_scale = anchor_scale[:, :3]
         gaussian_base_scale = anchor_scale[:, 3:]
 
-        cov_raw = self.cov_head(h).view(N, K, 7)
+        cov_raw = self.cov_mlp(view_feat).view(N, K, 7)
         scale_raw = cov_raw[..., :3]
         quat_raw  = cov_raw[..., 3:7]
 
+        # print gaussian_base_scale and scale_raw for debugging
+        
+        # print(f"gaussian_base_scale: shape={gaussian_base_scale.shape}, nan={torch.isnan(gaussian_base_scale).any().item()}, inf={torch.isinf(gaussian_base_scale).any().item()}, min={gaussian_base_scale.nan_to_num().min().item():.6f}, max={gaussian_base_scale.nan_to_num().max().item():.6f}, mean={gaussian_base_scale.nan_to_num().mean().item():.6f}")
+        # print(f"scale_raw: shape={scale_raw.shape}, nan={torch.isnan(scale_raw).any().item()}, inf={torch.isinf(scale_raw).any().item()}, min={scale_raw.nan_to_num().min().item():.6f}, max={scale_raw.nan_to_num().max().item():.6f}, mean={scale_raw.nan_to_num().mean().item():.6f}")
         # scale_raw = self.scale_head(h).view(N, K, 3)               # [N, K, 3]
         scales = gaussian_base_scale[:, None, :] * torch.sigmoid(scale_raw) + 1e-4
 
@@ -273,20 +315,11 @@ class VoxelGaussianDecoder(nn.Module):
         # ---------------------------------------------
         # Appearance heads
         # ---------------------------------------------
-        if self.use_view_conditioning:
-            if camera_xyz is None:
-                raise ValueError(
-                    "camera_xyz must be provided when use_view_conditioning=True"
-                )
-            view_feat = self._build_view_feature(anchor_xyz, camera_xyz)  # [N, 5]
-            app_input = torch.cat([h, view_feat], dim=-1)                # [N, H+5]
-        else:
-            app_input = h
 
-        opacity_raw = self.opacity_head(app_input).view(N, K, 1)
+        opacity_raw = self.opacity_mlp(view_feat).view(N, K, 1)
         opacity = torch.sigmoid(opacity_raw)
 
-        color_raw = self.color_head(app_input).view(N, K, 3)
+        color_raw = self.color_mlp(view_feat).view(N, K, 3)
         if self.color_act == "sigmoid":
             colors = torch.sigmoid(color_raw)
         elif self.color_act == "tanh":

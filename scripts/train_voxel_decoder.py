@@ -24,7 +24,7 @@ from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
 from types import SimpleNamespace
 from PIL import Image
 
-from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj_mode
+from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj_mode, render_3dgs
 from depth_anything_3.specs import Gaussians
 
 from PIL import Image
@@ -288,6 +288,11 @@ def compute_photometric_loss(
     # print(f"gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}")
     # print(f"rendered_rgb range: [{rendered_rgb.min().item():.4f}, {rendered_rgb.max().item():.4f}]"
     #       f", gt_rgb range: [{gt_rgb.min().item():.4f}, {gt_rgb.max().item():.4f}]")
+
+    # print dim of rendered_rgb and gt_rgb for debugging
+    # print(f"rendered_rgb: shape={rendered_rgb.shape}, dtype={rendered_rgb.dtype}, device={rendered_rgb.device}")
+    # print(f"gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}")
+
     losses["photo"] = F.l1_loss(rendered_rgb, gt_rgb)
 
     # for k, v in decoder_out.items():
@@ -419,36 +424,48 @@ def render_views_from_decoder_output(
 
     extrinsics = ensure_homogeneous_extrinsics(extrinsics)
     intrinsics = normalize_intrinsics(intrinsics, H=H, W=W)
+    view_indices = torch.as_tensor(view_indices, device=extrinsics.device, dtype=torch.long).reshape(-1)
+    if len(view_indices) == 1:
+        extr_sel = extrinsics.index_select(0, view_indices)
+        intr_sel = intrinsics.index_select(0, view_indices)
+        color, depth = render_3dgs(
+            gaussian=gs_world,
+            extrinsics=extr_sel,
+            intrinsics=intr_sel,
+            image_shape=image_hw,
+            chunk_size=chunk_size,
+            trj_mode="original",
+            use_sh=True,
+            color_mode="RGB+ED",
+            enable_tqdm=False,
+        )
+    else:
+        extr_sel = extrinsics.index_select(0, view_indices).unsqueeze(0)
+        intr_sel = intrinsics.index_select(0, view_indices).unsqueeze(0)   # [v,3,3]
+        color, depth = run_renderer_in_chunk_w_trj_mode(
+            gaussians=gs_world,
+            extrinsics=extr_sel,
+            intrinsics=intr_sel,
+            image_shape=image_hw,
+            chunk_size=chunk_size,
+            trj_mode="original",
+            use_sh=True,
+            color_mode="RGB+ED",
+            enable_tqdm=False,
+        )
 
-    extr_sel = extrinsics[view_indices].unsqueeze(0)   # [1,v,4,4] or [1,v,3,4]
-    intr_sel = intrinsics[view_indices].unsqueeze(0)   # [1,v,3,3]
-
-    # print(f"H={H}, W={W}")
-
-    # print intr_sel and extr_sel for debugging
-    # print(f"intr_sel: shape={intr_sel.shape}, dtype={intr_sel.dtype}, device={intr_sel.device}")
     # print(f"extr_sel: shape={extr_sel.shape}, dtype={extr_sel.dtype}, device={extr_sel.device}")
+    # print(f"intr_sel: shape={intr_sel.shape}, dtype={intr_sel.dtype}, device={intr_sel.device}")
 
-    # print intr_sel examples
-    # print(f"intr_sel examples:")
-    # for i in range(min(5, intr_sel.shape[1])):
-    #     print(f"  View {i}: {intr_sel[0,i].detach().cpu().numpy()}")
-
-    color, depth = run_renderer_in_chunk_w_trj_mode(
-        gaussians=gs_world,
-        extrinsics=extr_sel,
-        intrinsics=intr_sel,
-        image_shape=image_hw,
-        chunk_size=chunk_size,
-        trj_mode="original",
-        use_sh=True,
-        color_mode="RGB+ED",
-        enable_tqdm=False,
-    )
 
     # DA3 export code uses color[idx] as a video tensor, so color is batched at dim 0.
+    # print color.shape, depth.shape
+    # print(f"Rendered color: shape={color.shape}, dtype={color.dtype}, device={color.device}")
+    # print(f"Rendered depth: shape={depth.shape}, dtype={depth.dtype}, device={depth.device}")
     rendered_rgb = color[0]   # [v,3,H,W]
     rendered_depth = depth[0] if depth.ndim >= 4 else depth
+    # print(f"Extracted rendered_rgb: shape={rendered_rgb.shape}, dtype={rendered_rgb.dtype}, device={rendered_rgb.device}")
+    # print(f"Extracted rendered_depth: shape={rendered_depth.shape}, dtype={rendered_depth.dtype}, device={rendered_depth.device}")
 
     return rendered_rgb, rendered_depth, flat_scene
 
@@ -468,18 +485,9 @@ def train_one_step_on_scene(
     gt_images = scene_cache["images"]         # [V,3,H,W]
     intrinsics = scene_cache["intrinsics"]    # [V,3,3]
     extrinsics = scene_cache["extrinsics"]    # [V,4,4] or [V,3,4]
+    camera_xyz = scene_cache["camera_xyz"]      # [V,3]
 
-    decoder_out = decoder(
-        anchor_xyz=dec_in["anchor_xyz"],
-        dino_feat=dec_in["dino_feat"],
-        confidence=dec_in["confidence"],
-        cov_diag=dec_in["cov_diag"],
-    )
 
-    # print gt_images shape and dtype for debugging
-    # print(f"gt_images: shape={gt_images.shape}, dtype={gt_images.dtype}")
-    # AttributeError: 'numpy.ndarray' object has no attribute 'permute'
-    # gt_images = gt_images.permute(0, 3, 1, 2).contiguous() # [V,3,H,W]
     gt_images = (
         torch.from_numpy(gt_images)
         .permute(0,3,1,2)
@@ -492,60 +500,123 @@ def train_one_step_on_scene(
     num_views = min(views_per_step, V)
     view_indices = torch.randperm(V, device=device)[:num_views]
 
-    rendered_rgb, rendered_depth, flat_scene = render_views_from_decoder_output(
-        decoder_out=decoder_out,
-        intrinsics=intrinsics,
-        extrinsics=extrinsics,
-        image_hw=(H, W),
-        view_indices=view_indices,
-        chunk_size=render_chunk_size,
-    )
-    # save rendered_rgb and gt_images for debugging
-    # print(f"rendered_rgb: shape={rendered_rgb.shape}, dtype={rendered_rgb.dtype}, device={rendered_rgb.device}")
-    # print(f"gt_images: shape={gt_images.shape}, dtype={gt_images.dtype}, device={gt_images.device}")
+    # Now we need to select the camera_xyz to input into the decoder.
+
+    decoder_outs = []
+    rendered_rgbs = []
+
+    total_loss = 0.0
+    photo_loss_sum = 0.0
+    offset_reg_sum = 0.0
+    rendered_rgbs_to_log = []
+    gt_rgbs_to_log = []
+
+    flat_scene_stats = None
     
-    gt_images = gt_images.to(device)
-    gt_rgb = gt_images[view_indices]
+    for i, view in enumerate(view_indices):
+        decoder_out = decoder(
+            anchor_xyz=dec_in["anchor_xyz"],
+            camera_xyz=camera_xyz[view:view+1],  # select one view's camera_xyz at a time, shape [1,3]
+            dino_feat=dec_in["dino_feat"],
+            confidence=dec_in["confidence"],
+            cov_diag=dec_in["cov_diag"],
+        )
+        rendered_rgb, rendered_depth, flat_scene = render_views_from_decoder_output(
+            decoder_out=decoder_out,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            image_hw=(H, W),
+            view_indices=[view],
+            # view_indices=view_indices,
+            chunk_size=render_chunk_size,
+        )
+        # decoder_outs.append(decoder_out)
+        # rendered_rgbs.append(rendered_rgb)
+        gt_rgb = gt_images[view:view+1]
+        gt_rgb = gt_rgb.to(rendered_rgb.device)
 
-    # save image for debugging
-    # for i in range(num_views):
-    #     save_tensor_image(rendered_rgb[i], f"debug_rendered_view_{i}.png")
-    #     save_tensor_image(gt_images[view_indices[i]], f"debug_gt_view_{i}.png")
+        losses = compute_photometric_loss(
+            decoder_out=decoder_out,
+            voxel_dict=voxel_dict,
+            rendered_rgb=rendered_rgb,
+            gt_rgb=gt_rgb,
+        )
 
-    # print size of rendered_rgb and gt_rgb for debugging
-    # print(f"rendered_rgb: shape={rendered_rgb.shape}, dtype={rendered_rgb.dtype}, device={rendered_rgb.device}")
-    # print(f"gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}")
+        total_loss = total_loss + losses["total"]
+        photo_loss_sum += losses["photo"].detach()
+        offset_reg_sum += losses["offset_reg"].detach()
 
-    losses = compute_photometric_loss(
-        decoder_out=decoder_out,
-        voxel_dict=voxel_dict,
-        rendered_rgb=rendered_rgb,
-        gt_rgb=gt_rgb,
-    )
+        if i == 0:
+            rendered_rgbs_to_log.append(rendered_rgb.detach().cpu())
+            gt_rgbs_to_log.append(gt_rgb.detach().cpu())
+            flat_scene_stats = {
+                "num_gaussians": int(flat_scene["means3D"].shape[0]),
+                "mean_opacity": float(flat_scene["opacity"].mean().item()),
+                "mean_scale": float(flat_scene["scales"].mean().item()),
+                "mean_abs_center": float(flat_scene["means3D"].abs().mean().item()),
+            }
 
-    losses["total"].backward()
+        del decoder_out, rendered_rgb, rendered_depth, flat_scene, losses
+
+    total_loss = total_loss / num_views
+    total_loss.backward()
     optimizer.step()
 
-    flat_scene_stats = {
-        "num_gaussians": int(flat_scene["means3D"].shape[0]),
-        "mean_opacity": float(flat_scene["opacity"].mean().item()),
-        "mean_scale": float(flat_scene["scales"].mean().item()),
-        "mean_abs_center": float(flat_scene["means3D"].abs().mean().item()),
-    }
+    # decoder_outs = torch.cat(decoder_outs, dim=0)  # [v, ...]
+    # for each value in decoder_out, we stack them along dim 0 corresponding to views, so we can compute loss against gt_images[view_indices]
+
+    # for k in decoder_outs[0].keys():
+    #     decoder_outs[0][k] = torch.cat([d[k] for d in decoder_outs], dim=0)  # now decoder_outs[0][k] has shape [v, ...]
+    # del decoder_outs[1:]  # free memory
+    # decoder_outs = decoder_outs[0]  # we only need one dict since they are now concatenated
+    # rendered_rgbs = torch.stack(rendered_rgbs, dim=0)  # [v,3,H,W]
+    
+    # gt_images = gt_images.to(device)
+    # gt_rgb = gt_images[view_indices]
+
+    # losses = compute_photometric_loss(
+    #     decoder_out=decoder_outs,
+    #     voxel_dict=voxel_dict,
+    #     rendered_rgb=rendered_rgbs,
+    #     gt_rgb=gt_rgb,
+    # )
+
+    # losses["total"].backward()
+    # optimizer.step()
+
+    # flat_scene_stats = {
+    #     "num_gaussians": int(flat_scene["means3D"].shape[0]),
+    #     "mean_opacity": float(flat_scene["opacity"].mean().item()),
+    #     "mean_scale": float(flat_scene["scales"].mean().item()),
+    #     "mean_abs_center": float(flat_scene["means3D"].abs().mean().item()),
+    # }
 
     return {
-        "losses": losses,
-        "flat_scene": flat_scene,
-        "rendered_rgb": rendered_rgb.detach(),
-        "gt_rgb": gt_rgb.detach(),
-        "view_indices": view_indices.detach(),
+        "losses": {
+            "total": total_loss.detach(),
+            "photo": photo_loss_sum / num_views,
+            "offset_reg": offset_reg_sum / num_views,
+        },
+        "rendered_rgb": rendered_rgbs_to_log[0],
+        "gt_rgb": gt_rgbs_to_log[0],
+        "view_indices": view_indices.detach().cpu(),
         "scene_stats": flat_scene_stats,
     }
+
+    # return {
+    #     "losses": losses,
+    #     "flat_scene": flat_scene,
+    #     "rendered_rgb": rendered_rgbs.detach().cpu(),
+    #     "gt_rgb": gt_rgb.detach().cpu(),
+    #     "view_indices": view_indices.detach().cpu(),
+    #     "scene_stats": flat_scene_stats,
+    # }
 
 def train_one_group(
     decoder: VoxelGaussianDecoder,
     optimizer: torch.optim.Optimizer,
     group_scene_caches: dict,
+    views_per_step: int,
     steps_per_group: int,
     device: torch.device,
 ):
@@ -560,6 +631,7 @@ def train_one_group(
             decoder=decoder,
             optimizer=optimizer,
             scene_cache=scene_cache,
+            views_per_step=views_per_step,
             device=device,
         )
 
@@ -595,6 +667,7 @@ def verify_scene(
     gt_images = scene_cache["images"]       # [V,3,H,W]
     intrinsics = scene_cache["intrinsics"]
     extrinsics = scene_cache["extrinsics"]
+    camera_xyz = scene_cache["camera_xyz"]
 
     V, _, H, W = gt_images.shape
     view_indices = select_valid_view_indices(V, view_indices)
@@ -718,6 +791,14 @@ def prepare_scene_cache(
 
     intrinsics = torch.from_numpy(prediction.intrinsics).float().to(device)  # [V,3,3]
     extrinsics = torch.from_numpy(prediction.extrinsics).float().to(device)  # likely [V,4,4] or [V,3,4]
+    # extrract from extrinsics if possible, otherwise raise error
+    # print(f"extrinsics shape: {extrinsics.shape}")
+    if extrinsics.shape[-2:] == (4, 4):
+        camera_xyz = extrinsics[:, :3, 3]  # [V,3]
+    elif extrinsics.shape[-2:] == (3, 4):
+        camera_xyz = extrinsics[:, :3, 3]  # [V,3]
+    else:
+        raise ValueError(f"Unsupported extrinsics shape: {extrinsics.shape}")
 
     return {
         "prediction": prediction,
@@ -727,6 +808,7 @@ def prepare_scene_cache(
         "intrinsics": intrinsics,
         "extrinsics": extrinsics,
         "image_paths": image_paths,
+        "camera_xyz": camera_xyz,
     }
 
 @torch.no_grad()
@@ -768,33 +850,44 @@ def verify_scene_no_cache(
 
     # 3 build decoder input
     decoder_inputs = build_decoder_inputs(voxel_dict, device=device)
+    camera_xyz = extrinsics[:, :3, 3].to(device)  # [V,3]
 
-    # 4 decoder
-    decoder_out = decoder(**decoder_inputs)
+    # decoder_outs = []
+    rendered_rgbs = []
 
-    # 5 render
+    for view in view_indices:
+        decoder_out = decoder(
+            anchor_xyz=decoder_inputs["anchor_xyz"],
+            camera_xyz=camera_xyz[view:view+1],   # [1, 3]
+            dino_feat=decoder_inputs["dino_feat"],
+            confidence=decoder_inputs["confidence"],
+            cov_diag=decoder_inputs["cov_diag"],
+        )
+
+        pred_rgb, pred_depth, flat_scene = render_views_from_decoder_output(
+            decoder_out=decoder_out,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            image_hw=(H, W),
+            view_indices=[view],   # 只 render 這個 view
+        )
+
+        # decoder_outs.append(decoder_out)
+        rendered_rgbs.append(pred_rgb)
+
+    # for k in decoder_outs[0].keys():
+    #     decoder_outs[0][k] = torch.cat([d[k] for d in decoder_outs], dim=0)  # now decoder_outs[0][k] has shape [v, ...]
+    # del decoder_outs[1:]  # free memory
+    # decoder_outs = decoder_outs[0]  # we only need one dict since they are now concatenated
+    rendered_rgbs = torch.stack(rendered_rgbs, dim=0)  # [v,3,H,W]
+    
     view_tensor = torch.tensor(view_indices, device=device)
-
-    # print decoder_out min, max, ...
-    # for k, v in decoder_out.items():
-    #     if torch.is_tensor(v):
-    #         print(f"{k}: min={v.min().item():.6f}, max={v.max().item():.6f}")
-        
-
-
-    pred_rgb, pred_depth, flat_scene = render_views_from_decoder_output(
-        decoder_out=decoder_out,
-        intrinsics=intrinsics,
-        extrinsics=extrinsics,
-        image_hw=(H, W),
-        view_indices=view_tensor,
-    )
 
     gt_images = gt_images.to(device)
     gt_rgb = gt_images[view_tensor]
 
     # 6 metric
-    l1 = F.l1_loss(pred_rgb, gt_rgb).item()
+    l1 = F.l1_loss(rendered_rgbs, gt_rgb).item()
 
     # 7 save
     scene_dir = os.path.join(output_dir, "verification", f"epoch_{epoch:04d}", scene_name)
@@ -802,8 +895,8 @@ def verify_scene_no_cache(
 
     for i, view_idx in enumerate(view_indices):
         save_tensor_image(gt_rgb[i], f"{scene_dir}/view_{view_idx}_gt.png")
-        save_tensor_image(pred_rgb[i], f"{scene_dir}/view_{view_idx}_pred.png")
-        save_diff_image(pred_rgb[i], gt_rgb[i], f"{scene_dir}/view_{view_idx}_diff.png")
+        save_tensor_image(rendered_rgbs[i], f"{scene_dir}/view_{view_idx}_pred.png")
+        save_diff_image(rendered_rgbs[i], gt_rgb[i], f"{scene_dir}/view_{view_idx}_diff.png")
 
     save_gaussian_scene_npz(
         flat_scene,
@@ -870,9 +963,9 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--group-size", type=int, default=2)
-    parser.add_argument("--steps-per-group", type=int, default=20)
+    parser.add_argument("--steps-per-group", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--views-per-step", type=int, default=5)
+    parser.add_argument("--views-per-step", type=int, default=2)
     parser.add_argument("--render-chunk-size", type=int, default=2)
     parser.add_argument("--lambda-photo", type=float, default=1.0)
     parser.add_argument("--lambda-color", type=float, default=0.1)
@@ -948,6 +1041,7 @@ def main():
         val_scenes = scenes[-args.val_max_scenes:]
         train_scenes = scenes[:-args.val_max_scenes] if len(scenes) > args.val_max_scenes else scenes
     # scenes = scenes[:1]
+    # val_scenes = scenes[:1]
 
     model = DepthAnything3.from_pretrained(args.model_id).to(device)
     model.eval()
@@ -982,7 +1076,6 @@ def main():
         dino_dim=dino_dim,
         hidden_dim=args.hidden_dim,
         num_gaussians=args.num_gaussians,
-        use_view_conditioning=False,
     ).to(device)
 
     optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
@@ -1039,6 +1132,7 @@ def main():
                 optimizer=optimizer,
                 group_scene_caches=group_cache,
                 steps_per_group=args.steps_per_group,
+                views_per_step=args.views_per_step,
                 device=device,
             )
 
@@ -1072,7 +1166,11 @@ def main():
                     })
 
                     if global_step % args.wandb_log_train_images_every == 0:
-                        pred0 = log_item["rendered_rgb"][0].detach().cpu()
+                        # print log_item["rendered_rgb"].shape, log_item["gt_rgb"].shape
+                        # print(f"[DEBUG] log_item['rendered_rgb'] shape={log_item['rendered_rgb'].shape}, dtype={log_item['rendered_rgb'].dtype}, device={log_item['rendered_rgb'].device}")
+                        # print(f"[DEBUG] log_item['gt_rgb'] shape={log_item['gt_rgb'].shape}, dtype={log_item['gt_rgb'].dtype}, device={log_item['gt_rgb'].device}")
+                        # pred0 = log_item["rendered_rgb"][0].detach().cpu()
+                        pred0 = log_item["rendered_rgb"].detach().cpu()
                         gt0 = log_item["gt_rgb"][0].detach().cpu()
                         imgs = make_wandb_image_triplet(
                             pred=pred0,
@@ -1098,6 +1196,7 @@ def main():
         
         if epoch % args.val_every == 0:
             val_l1_list = []
+            print(f"\n[INFO] Validation for epoch {epoch:04d} on {len(val_scenes)} scenes")
             for scene in val_scenes:
                 verify_out = safe_verify_scene_no_cache(
                     decoder=decoder,
@@ -1128,7 +1227,12 @@ def main():
                     }
 
                     if args.wandb_log_val_images:
-                        pred0 = val_info["pred_rgb"][0]
+                        # print(f"[DEBUG] log_item['pred_rgb'] shape={val_info['pred_rgb'].shape}, dtype={val_info['pred_rgb'].dtype}, device={val_info['pred_rgb'].device}")
+                        # print(f"[DEBUG] log_item['gt_rgb'] shape={val_info['gt_rgb'].shape}, dtype={val_info['gt_rgb'].dtype}, device={val_info['gt_rgb'].device}")
+                        # pred0 = val_info["pred_rgb"][0]
+                        # gt rgb is now [3, 3, 336, 504], check it!
+
+                        pred0 = val_info["pred_rgb"]
                         gt0 = val_info["gt_rgb"][0]
                         val_log[f"val/{val_info['scene_name']}_samples"] = make_wandb_image_triplet(
                             pred=pred0,

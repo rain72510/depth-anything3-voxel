@@ -12,8 +12,7 @@ WANDB_MODE=online CUDA_VISIBLE_DEVICES=5 python scripts/train_voxel_decoder.py \
   --wandb-project voxel-anchored-3dgs \
   --wandb-run-name exp01 \
   --wandb-log-train-images-every 1 \
-  --wandb-log-val-images \
-  --wandb-watch-model
+  --wandb-log-val-images
 
 
   [WARN] Skip scene 10391312872392849784_4099_400_4119_400: CUDA out of memory. Tried to allocate 662.00 MiB. GPU 0 has a total capacity of 23.68 GiB of which 619.44 MiB is free. Including non-PyTorch memory, this process has 23.07 GiB memory in use. Of the allocated memory 17.44 GiB is allocated by PyTorch, and 5.37 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

@@ -24,3 +24,60 @@ Voxelization complete.
 Voxelization complete.
 [INFO ] Selecting reference view using strategy: saddle_balanced
 [WARN] Skip scene 1022527355599519580_4866_960_4886_960: CUDA out of memory. Tried to allocate 610.00 MiB. GPU 0 has a total capacity of 23.68 GiB of which 163.44 MiB is free. Including non-PyTorch memory, this process has 23.51 GiB memory in use. Of the allocated memory 20.57 GiB is allocated by PyTorch, and 2.68 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+
+
+ WANDB_MODE=online CUDA_VISIBLE_DEVICES=1 python scripts/train_voxel_decoder.py \
+  --dataset-root datasets/waymo \
+  --output-dir output_train_voxel_decoder \
+  --epochs 1000 \
+  --voxel-size 0.4 \
+  --max-depth 50 \
+  --conf-percentile 40 \
+  --feat-mode last2_avg \
+  --feat-dim-out 128 \
+  --val-every 5 \
+  --num-gaussians 1 \
+  --use-wandb \
+  --wandb-project voxel-anchored-3dgs \
+  --wandb-run-name exp06-color-scale \
+  --wandb-log-train-images-every 1 \
+  --wandb-log-val-images
+
+
+
+WANDB_MODE=online CUDA_VISIBLE_DEVICES=1 python scripts/train_voxel_decoder.py \
+  --dataset-root datasets/waymo \
+  --output-dir output_train_voxel_decoder \
+  --epochs 200 \
+  --voxel-size 0.4 \
+  --views-per-step 6 \
+  --max-depth 50 \
+  --conf-percentile 40 \
+  --feat-mode last2_avg \
+  --feat-dim-out 128 \
+  --val-every 10 \
+  --num-gaussians 1 \
+  --use-wandb \
+  --wandb-project voxel-anchored-3dgs \
+  --wandb-run-name exp08 \
+  --wandb-log-train-images-every 10 \
+  --wandb-log-val-images
+
+WANDB_MODE=online CUDA_VISIBLE_DEVICES=6 python scripts/train_voxel_decoder.py \
+  --dataset-root datasets/waymo \
+  --output-dir output_train_voxel_decoder \
+  --epochs 200 \
+  --voxel-size 0.4 \
+  --views-per-step 6 \
+  --max-depth 50 \
+  --conf-percentile 40 \
+  --feat-mode last2_avg \
+  --feat-dim-out 128 \
+  --val-every 10 \
+  --num-gaussians 1 \
+  --use-wandb \
+  --wandb-project voxel-anchored-3dgs \
+  --wandb-run-name exp08-pre-color-color-input \
+  --wandb-log-train-images-every 10 \
+  --wandb-log-val-images

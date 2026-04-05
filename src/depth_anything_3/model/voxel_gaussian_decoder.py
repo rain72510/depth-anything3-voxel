@@ -73,6 +73,8 @@ class VoxelGaussianDecoder(nn.Module):
         use_view_conditioning: bool = True,
         use_distance: bool = True,
         color_act: str = "sigmoid",
+        use_voxel_color: bool = True,
+        voxel_size: float = 0.4,
     ):
         super().__init__()
 
@@ -85,6 +87,11 @@ class VoxelGaussianDecoder(nn.Module):
         self.use_cov_diag = use_cov_diag
         self.use_view_conditioning = use_view_conditioning
         self.use_distance = use_distance
+        self.voxel_size = voxel_size
+        self.use_voxel_color = use_voxel_color
+
+        # print
+        print(f"Initialized VoxelGaussianDecoder with dino_dim={dino_dim}, hidden_dim={hidden_dim}, num_gaussians={num_gaussians}, use_confidence={use_confidence}, use_cov_diag={use_cov_diag}, use_view_conditioning={use_view_conditioning}, use_distance={use_distance}, color_act={color_act}, voxel_size={voxel_size}, use_voxel_color={use_voxel_color}")
         
 
         # --------------------------------------------------
@@ -94,7 +101,7 @@ class VoxelGaussianDecoder(nn.Module):
         #   confidence        -> 1
         # total = F + 4
         # --------------------------------------------------
-        self.anchor_in_dim = dino_dim + 3 + 1
+        self.anchor_in_dim = dino_dim
 
         self.anchor_encoder = nn.Sequential(
             nn.Linear(self.anchor_in_dim, hidden_dim),
@@ -105,11 +112,16 @@ class VoxelGaussianDecoder(nn.Module):
         # --------------------------------------------------
         # view-dependent input:
         #   anchor_in_dim   -> h
+        #   covariance      -> 3
+        #   confidence      -> 1
         #   direction       -> 3
         #   distance        -> 1
         # total = h + 4
         # --------------------------------------------------
-        self.view_in_dim = hidden_dim + 3 + (1 if use_distance else 0)
+        self.nview_in_dim = hidden_dim + 3 + 1
+        
+        self.view_in_dim = self.nview_in_dim + 3 + (1 if use_distance else 0)
+        self.color_in_dim = self.view_in_dim + (3 if use_voxel_color else 0)
 
         # --------------------------------------------------
         # Global learnable offset template, like scaffold prior
@@ -129,13 +141,13 @@ class VoxelGaussianDecoder(nn.Module):
         # Geometry heads (intrinsic, not view-dependent)
         # --------------------------------------------------
         self.offset_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(self.nview_in_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, num_gaussians * 3),
         )
 
         self.scaling_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(self.nview_in_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 6),  # 3 for anchor scale, 3 for gaussian base scale
         )
@@ -157,21 +169,22 @@ class VoxelGaussianDecoder(nn.Module):
         )
 
         self.opacity_mlp = nn.Sequential(
-            nn.Linear(self.view_in_dim, hidden_dim),
+            nn.Linear(self.color_in_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, num_gaussians),
-            nn.Tanh(),
+            # nn.Tanh(),
         )
 
         self.color_mlp = nn.Sequential(
-            nn.Linear(self.view_in_dim, hidden_dim),
+            nn.Linear(self.color_in_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, num_gaussians * 3),
+            # nn.Sigmoid(),
         )
 
     def _build_anchor_input(
         self,
-        dino_feat: torch.Tensor,
+        feature: torch.Tensor,
         confidence: torch.Tensor,
         cov_diag: torch.Tensor,
     ) -> torch.Tensor:
@@ -183,7 +196,7 @@ class VoxelGaussianDecoder(nn.Module):
         if confidence.ndim == 1:
             confidence = confidence.unsqueeze(-1)
 
-        return torch.cat([dino_feat, confidence, cov_diag], dim=-1)
+        return torch.cat([feature, confidence, cov_diag], dim=-1)
 
     def _build_view_feature_old(
         self,
@@ -232,7 +245,7 @@ class VoxelGaussianDecoder(nn.Module):
         dist = vec.norm(dim=-1, keepdim=True).clamp_min(eps)
         view_dir = vec / dist
         log_dist = dist.log()
-        return torch.cat([feature,view_dir, log_dist], dim=-1)
+        return torch.cat([feature, view_dir, dist], dim=-1)
 
     def forward(
         self,
@@ -241,6 +254,7 @@ class VoxelGaussianDecoder(nn.Module):
         confidence: torch.Tensor,
         cov_diag: torch.Tensor,
         camera_xyz: Optional[torch.Tensor] = None,
+        voxel_colors: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         anchor_xyz: [N, 3]
@@ -271,13 +285,15 @@ class VoxelGaussianDecoder(nn.Module):
         # ---------------------------------------------
         # Anchor latent
         # ---------------------------------------------
-        anchor_input = self._build_anchor_input(
-            dino_feat=dino_feat,
+
+        h = self.anchor_encoder(dino_feat)  # [N, H]
+        
+        h = self._build_anchor_input(
+            feature=h,
             confidence=confidence,
             cov_diag=cov_diag,
         )  # [N, F+4]
 
-        h = self.anchor_encoder(anchor_input)  # [N, H]
         if self.use_view_conditioning:
             if camera_xyz is None:
                 raise ValueError(
@@ -302,24 +318,29 @@ class VoxelGaussianDecoder(nn.Module):
 
         # print gaussian_base_scale and scale_raw for debugging
         
-        # print(f"gaussian_base_scale: shape={gaussian_base_scale.shape}, nan={torch.isnan(gaussian_base_scale).any().item()}, inf={torch.isinf(gaussian_base_scale).any().item()}, min={gaussian_base_scale.nan_to_num().min().item():.6f}, max={gaussian_base_scale.nan_to_num().max().item():.6f}, mean={gaussian_base_scale.nan_to_num().mean().item():.6f}")
-        # print(f"scale_raw: shape={scale_raw.shape}, nan={torch.isnan(scale_raw).any().item()}, inf={torch.isinf(scale_raw).any().item()}, min={scale_raw.nan_to_num().min().item():.6f}, max={scale_raw.nan_to_num().max().item():.6f}, mean={scale_raw.nan_to_num().mean().item():.6f}")
         # scale_raw = self.scale_head(h).view(N, K, 3)               # [N, K, 3]
-        scales = gaussian_base_scale[:, None, :] * torch.sigmoid(scale_raw) + 1e-4
+        # scales = gaussian_base_scale[:, None, :] * torch.sigmoid(scale_raw) + 1e-4
+        scales = torch.sigmoid(scale_raw) * self.voxel_size * 2.5
 
-        # quat_raw = self.quat_head(h).view(N, K, 4)                 # [N, K, 4]
         quaternions = normalize_quaternion(quat_raw)
 
-        centers = anchor_xyz[:, None, :] + offsets * offset_scale[:, None, :]
+        centers = anchor_xyz[:, None, :] + torch.tanh(offsets * offset_scale[:, None, :]) * self.voxel_size
 
         # ---------------------------------------------
         # Appearance heads
         # ---------------------------------------------
 
-        opacity_raw = self.opacity_mlp(view_feat).view(N, K, 1)
-        opacity = torch.sigmoid(opacity_raw)
+        color_feat = view_feat
+        if self.use_voxel_color:
+            if voxel_colors is None:
+                raise ValueError("voxel_colors must be provided when use_voxel_color=True")
+            color_feat = torch.cat([view_feat, voxel_colors], dim=-1)
 
-        color_raw = self.color_mlp(view_feat).view(N, K, 3)
+        opacity_raw = self.opacity_mlp(color_feat).view(N, K, 1)
+        # opacity = torch.tanh(opacity_raw)
+        opacity = torch.sigmoid(opacity_raw - 2.0)
+
+        color_raw = self.color_mlp(color_feat).view(N, K, 3)
         if self.color_act == "sigmoid":
             colors = torch.sigmoid(color_raw)
         elif self.color_act == "tanh":
@@ -343,4 +364,5 @@ class VoxelGaussianDecoder(nn.Module):
             "opacity": opacity,             # [N, K, 1]
             "colors": colors,               # [N, K, 3]
             "anchor_latent": h,             # [N, H]
+            "offset_scale": offset_scale,       # [N, 3]
         }

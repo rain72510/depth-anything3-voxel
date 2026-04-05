@@ -13,6 +13,7 @@ import numpy as np
 import psutil
 import wandb
 import traceback
+import time
 
 from depth_anything_3.api import DepthAnything3
 
@@ -26,6 +27,8 @@ from PIL import Image
 
 from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj_mode, render_3dgs
 from depth_anything_3.specs import Gaussians
+from depth_anything_3.utils.gsply_helpers import export_ply
+from depth_anything_3.utils.loss_utils import ssim
 
 from PIL import Image
 import math
@@ -233,11 +236,19 @@ def build_decoder_inputs(voxel_dict: Dict[str, Any], device: torch.device) -> Di
         v = voxel_dict["voxel_view_counts"].to(device).float()
         confidence = v / v.max().clamp_min(1.0)
 
+    voxel_colors = None
+    if "voxel_colors" in voxel_dict and voxel_dict["voxel_colors"] is not None:
+        voxel_colors = voxel_dict["voxel_colors"].to(device).float()
+
+        if voxel_colors.max() > 1.0:
+            voxel_colors = voxel_colors / 255.0
+
     return {
         "anchor_xyz": anchor_xyz,   # [K, 3]
         "dino_feat": dino_feat,     # [K, C]
         "confidence": confidence,   # [K]
         "cov_diag": cov_diag,       # [K, 3]
+        "voxel_colors": voxel_colors,
     }
 
 
@@ -274,12 +285,14 @@ def compute_photometric_loss(
     rendered_rgb: torch.Tensor,   # [v,3,H,W]
     gt_rgb: torch.Tensor,         # [v,3,H,W]
     lambda_photo: float = 1.0,
-    lambda_color: float = 0.1,
-    lambda_offset: float = 1e-1,
+    lambda_color: float = 0.05,
+    lambda_offset: float = 1e-2,
     lambda_scale: float = 1e-3,
-    lambda_opacity: float = 1e-4,
+    lambda_opacity: float = 1e-2,
     lambda_anchor: float = 1e-4,
     lambda_disp: float = 1e-3,
+    lambda_dssim: float = 0.02,
+    lambda_scale_vol: float = 1e-3,
 ) -> Dict[str, torch.Tensor]:
     losses = {}
 
@@ -293,44 +306,73 @@ def compute_photometric_loss(
     # print(f"rendered_rgb: shape={rendered_rgb.shape}, dtype={rendered_rgb.dtype}, device={rendered_rgb.device}")
     # print(f"gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}")
 
-    losses["photo"] = F.l1_loss(rendered_rgb, gt_rgb)
+    # print the first few pixel values of rendered_rgb and gt_rgb for debugging
+    # print(f"rendered_rgb sample: {rendered_rgb.view(3, -1)[:, :5]}")
+    # print(f"gt_rgb sample: {gt_rgb.view(3, -1)[:, :5]}")
+
+    # print shape, dtype, device, min, max of rendered_rgb and gt_rgb for debugging
+    # print(f"rendered_rgb: shape={rendered_rgb.shape}, dtype={rendered_rgb.dtype}, device={rendered_rgb.device}, "
+    #       f"min={rendered_rgb.min().item():.4f}, max={rendered_rgb.max().item():.4f}")
+    # print(f"gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}, "
+    #       f"min={gt_rgb.min().item():.4f}, max={gt_rgb.max().item():.4f}")
+
+
+    losses["photo"] = lambda_photo * F.l1_loss(rendered_rgb, gt_rgb)
 
     # for k, v in decoder_out.items():
     #     print(f"decoder_out[{k}]: shape={v.shape}, dtype={v.dtype}, device={v.device}, "
     #           f"min={v.min().item():.4f}, max={v.max().item():.4f}")
-
+    
+    # decoder_out["colors"] shape
+    # print(f"decoder_out['colors']: shape={decoder_out['colors'].shape}, dtype={decoder_out['colors'].dtype}, device={decoder_out['colors'].device}, "
+    #       f"min={decoder_out['colors'].min().item():.4f}, max={decoder_out['colors'].max().item():.4f}")
 
     # # 2. optional voxel color prior
-    # if voxel_dict.get("voxel_colors", None) is not None:
-    #     target_color = voxel_dict["voxel_colors"].to(decoder_out["colors"].device).float()
-    #     pred_color = decoder_out["colors"].mean(dim=1)
-    #     losses["color"] = F.l1_loss(pred_color, target_color)
-    # else:
-    #     losses["color"] = torch.tensor(0.0, device=decoder_out["colors"].device)
+    if voxel_dict.get("voxel_colors", None) is not None:
+        target_color = voxel_dict["voxel_colors"].to(decoder_out["colors"].device).float()/255.0
+        pred_color = decoder_out["colors"].mean(dim=1)
+        # print dim, dtype, device, min, max of pred_color and target_color for debugging
+        # print(f"pred_color: shape={pred_color.shape}, dtype={pred_color.dtype}, device={pred_color.device}, "
+        #       f"min={pred_color.min().item():.4f}, max={pred_color.max().item():.4f}")
+        # print(f"target_color: shape={target_color.shape}, dtype={target_color.dtype}, device={target_color.device}, "
+        #       f"min={target_color.min().item():.4f}, max={target_color.max().item():.4f}")
+
+        losses["color"] = lambda_color * F.l1_loss(pred_color, target_color)
+    else:
+        losses["color"] = lambda_color * torch.tensor(0.0, device=decoder_out["colors"].device)
 
     # # 3. geometry / regularization
-    losses["offset_reg"] = decoder_out["offsets"].pow(2).mean()
+    losses["offset_reg"] = lambda_offset * decoder_out["offsets"].pow(2).mean()
     # print(f"offset_reg: {losses['offset_reg'].item():.6f}")
-    # losses["scale_reg"] = torch.log(decoder_out["scales"] + 1e-8).pow(2).mean()
-    # losses["opacity_reg"] = decoder_out["opacity"].mean()
+    losses["scale_reg"] = lambda_scale * decoder_out["scales"].pow(2).mean()
+    losses["scale_vol_reg"] = lambda_scale_vol * decoder_out["scales"].prod(dim=1).mean()
+    losses["opacity_reg"] = lambda_opacity * decoder_out["opacity"].mean()
     # losses["anchor_scale_reg"] = decoder_out["anchor_scale"].pow(2).mean()
 
     # # actual displacement regularization
     # disp = decoder_out["offsets"] * decoder_out["anchor_scale"].unsqueeze(-1)
     # losses["disp_reg"] = disp.pow(2).mean()
     
+
+    ssim_val = ssim(rendered_rgb, gt_rgb)
+    dssim = (1.0 - ssim_val) / 2.0
+    losses["dssim"] = lambda_dssim * dssim
+
     # print all loss components for debugging
     # for k, v in losses.items():
     #     print(f"{k} loss: {v.item():.6f}")
 
     losses["total"] = (
-        lambda_photo * losses["photo"]
-        # + lambda_color * losses["color"]
-        + lambda_offset * losses["offset_reg"]
-        # + lambda_scale * losses["scale_reg"]
-        # + lambda_opacity * losses["opacity_reg"]
-        # + lambda_anchor * losses["anchor_scale_reg"]
-        # + lambda_disp * losses["disp_reg"]
+        losses["photo"]
+        + losses["color"]
+        + losses["offset_reg"]
+        + losses["scale_reg"]
+        + losses["scale_vol_reg"]
+        + losses["opacity_reg"]
+        # + losses["anchor_scale_reg"]
+        # + losses["disp_reg"]
+        + losses["dssim"]
+
     )
     return losses
 
@@ -353,22 +395,85 @@ def build_renderer_gaussians(flat_scene: Dict[str, torch.Tensor]):
     if opacities.ndim == 2 and opacities.shape[-1] == 1:
         opacities = opacities.squeeze(-1)   # -> [M]
 
-    M = means.shape[0]
-    device = means.device
-    dtype = means.dtype
+    # M = means.shape[0]
+    # device = means.device
+    # dtype = means.dtype
+    
     # harmonics: [1, M, 3, 9]
     # use RGB as SH DC term only
-    harmonics = torch.zeros((1, M, 3, 9), device=device, dtype=dtype)
-    harmonics[0, :, :, 0] = colors
+
+    # harmonics = torch.zeros((1, M, 3, 9), device=device, dtype=dtype)
+    # harmonics[0, :, :, 0] = colors
 
     gaussian = SimpleNamespace(
         means=means.unsqueeze(0),          # [1, M, 3]
         scales=scales.unsqueeze(0),        # [1, M, 3]
         rotations=rotations.unsqueeze(0),  # [1, M, 4]
         opacities=opacities.unsqueeze(0),  # [1, M]
-        harmonics=harmonics,               # [1, M, 3, 9]
+        # harmonics=harmonics,               # [1, M, 3, 9]
+        harmonics=colors.unsqueeze(0),              # [1, M, 3]
     )
     return gaussian
+
+def save_flat_scene_as_ply(
+    flat_scene: dict,
+    save_path: str,
+    save_sh_dc_only: bool = True,
+    shift_and_scale: bool = False,
+):
+    """
+    flat_scene:
+        means3D   [M,3]
+        scales    [M,3]
+        rotations [M,4]
+        opacity   [M,1] or [M]
+        colors    [M,3]   in [0,1]
+    """
+    means = flat_scene["means3D"].detach()
+    scales = flat_scene["scales"].detach().clamp_min(1e-8)
+    rotations = flat_scene["rotations"].detach()
+    opacities = flat_scene["opacity"].detach().reshape(-1).clamp(1e-6, 1 - 1e-6)
+    colors = flat_scene["colors"].detach().clamp(0.0, 1.0)
+
+    # SH degree 0 only: [M,3,1]
+    harmonics = colors.unsqueeze(-1)
+
+    export_ply(
+        means=means,
+        scales=scales,
+        rotations=rotations,
+        harmonics=harmonics,
+        opacities=opacities,
+        path=Path(save_path),
+        shift_and_scale=shift_and_scale,
+        save_sh_dc_only=save_sh_dc_only,
+        match_3dgs_mcmc_dev=False,
+    )
+
+def save_recent_training_ply(
+    flat_scene: dict,
+    output_dir: str,
+    epoch: int,
+    scene_name: str,
+    keep_last_k: int = 10,
+):
+    ply_root = os.path.join(output_dir, "train_ply")
+    os.makedirs(ply_root, exist_ok=True)
+
+    save_path = os.path.join(
+        ply_root,
+        f"epoch_{epoch:04d}_{scene_name}.ply"
+    )
+    save_flat_scene_as_ply(flat_scene, save_path)
+
+    all_ply = sorted(
+        glob.glob(os.path.join(ply_root, "epoch_*.ply")),
+        key=os.path.getmtime
+    )
+    if len(all_ply) > keep_last_k:
+        for old_path in all_ply[:-keep_last_k]:
+            os.remove(old_path)
+            print(f"[INFO] Removed old ply: {old_path}")
 
 def render_views_from_decoder_output(
     decoder_out: Dict[str, torch.Tensor],
@@ -435,7 +540,8 @@ def render_views_from_decoder_output(
             image_shape=image_hw,
             chunk_size=chunk_size,
             trj_mode="original",
-            use_sh=True,
+            # use_sh=True,
+            use_sh=False,
             color_mode="RGB+ED",
             enable_tqdm=False,
         )
@@ -506,21 +612,31 @@ def train_one_step_on_scene(
     rendered_rgbs = []
 
     total_loss = 0.0
-    photo_loss_sum = 0.0
-    offset_reg_sum = 0.0
+    loss_photo_sum = 0.0
+    loss_offset_reg_sum = 0.0
+    loss_scale_reg_sum = 0.0
+    loss_opacity_reg_sum = 0.0
+    loss_dssim_sum = 0.0
+    loss_color_sum = 0.0
+    loss_scale_vol_reg_sum = 0.0
     rendered_rgbs_to_log = []
     gt_rgbs_to_log = []
 
     flat_scene_stats = None
     
     for i, view in enumerate(view_indices):
+        # start = time.time()
         decoder_out = decoder(
             anchor_xyz=dec_in["anchor_xyz"],
             camera_xyz=camera_xyz[view:view+1],  # select one view's camera_xyz at a time, shape [1,3]
             dino_feat=dec_in["dino_feat"],
             confidence=dec_in["confidence"],
             cov_diag=dec_in["cov_diag"],
+            voxel_colors=dec_in["voxel_colors"],
         )
+        # print(f"Decoder forward pass done. Time: {time.time() - start:.2f} seconds.")
+
+        # start = time.time()
         rendered_rgb, rendered_depth, flat_scene = render_views_from_decoder_output(
             decoder_out=decoder_out,
             intrinsics=intrinsics,
@@ -530,21 +646,30 @@ def train_one_step_on_scene(
             # view_indices=view_indices,
             chunk_size=render_chunk_size,
         )
+        # print(f"Render views from decoder output done. Time: {time.time() - start:.2f} seconds.")
         # decoder_outs.append(decoder_out)
         # rendered_rgbs.append(rendered_rgb)
         gt_rgb = gt_images[view:view+1]
         gt_rgb = gt_rgb.to(rendered_rgb.device)
 
+        # start = time.time()
         losses = compute_photometric_loss(
             decoder_out=decoder_out,
             voxel_dict=voxel_dict,
             rendered_rgb=rendered_rgb,
             gt_rgb=gt_rgb,
         )
+        # print(f"Compute photometric loss done. Time: {time.time() - start:.2f} seconds.")
+
 
         total_loss = total_loss + losses["total"]
-        photo_loss_sum += losses["photo"].detach()
-        offset_reg_sum += losses["offset_reg"].detach()
+        loss_photo_sum = loss_photo_sum + losses["photo"].item()
+        loss_offset_reg_sum = loss_offset_reg_sum + losses["offset_reg"].item()
+        loss_scale_reg_sum = loss_scale_reg_sum + losses["scale_reg"].item()
+        loss_dssim_sum = loss_dssim_sum + losses["dssim"].item()
+        loss_opacity_reg_sum = loss_opacity_reg_sum + losses["opacity_reg"].item()
+        loss_color_sum = loss_color_sum + losses["color"].item()
+        loss_scale_vol_reg_sum = loss_scale_vol_reg_sum + losses["scale_vol_reg"].item()
 
         if i == 0:
             rendered_rgbs_to_log.append(rendered_rgb.detach().cpu())
@@ -555,52 +680,39 @@ def train_one_step_on_scene(
                 "mean_scale": float(flat_scene["scales"].mean().item()),
                 "mean_abs_center": float(flat_scene["means3D"].abs().mean().item()),
             }
+            flat_scene_to_save = {
+                "means3D": flat_scene["means3D"].detach().cpu(),
+                "scales": flat_scene["scales"].detach().cpu(),
+                "rotations": flat_scene["rotations"].detach().cpu(),
+                "opacity": flat_scene["opacity"].detach().cpu(),
+                "colors": flat_scene["colors"].detach().cpu(),
+            }
 
         del decoder_out, rendered_rgb, rendered_depth, flat_scene, losses
 
     total_loss = total_loss / num_views
+    # start = time.time()
     total_loss.backward()
     optimizer.step()
+    # print(f"Backward and optimizer step done. Time: {time.time() - start:.2f} seconds.")
 
-    # decoder_outs = torch.cat(decoder_outs, dim=0)  # [v, ...]
-    # for each value in decoder_out, we stack them along dim 0 corresponding to views, so we can compute loss against gt_images[view_indices]
-
-    # for k in decoder_outs[0].keys():
-    #     decoder_outs[0][k] = torch.cat([d[k] for d in decoder_outs], dim=0)  # now decoder_outs[0][k] has shape [v, ...]
-    # del decoder_outs[1:]  # free memory
-    # decoder_outs = decoder_outs[0]  # we only need one dict since they are now concatenated
-    # rendered_rgbs = torch.stack(rendered_rgbs, dim=0)  # [v,3,H,W]
-    
-    # gt_images = gt_images.to(device)
-    # gt_rgb = gt_images[view_indices]
-
-    # losses = compute_photometric_loss(
-    #     decoder_out=decoder_outs,
-    #     voxel_dict=voxel_dict,
-    #     rendered_rgb=rendered_rgbs,
-    #     gt_rgb=gt_rgb,
-    # )
-
-    # losses["total"].backward()
-    # optimizer.step()
-
-    # flat_scene_stats = {
-    #     "num_gaussians": int(flat_scene["means3D"].shape[0]),
-    #     "mean_opacity": float(flat_scene["opacity"].mean().item()),
-    #     "mean_scale": float(flat_scene["scales"].mean().item()),
-    #     "mean_abs_center": float(flat_scene["means3D"].abs().mean().item()),
-    # }
 
     return {
         "losses": {
             "total": total_loss.detach(),
-            "photo": photo_loss_sum / num_views,
-            "offset_reg": offset_reg_sum / num_views,
+            "photo": loss_photo_sum / num_views,
+            "offset_reg": loss_offset_reg_sum / num_views,
+            "scale_reg": loss_scale_reg_sum / num_views,
+            "dssim": loss_dssim_sum / num_views,
+            "opacity_reg": loss_opacity_reg_sum / num_views,
+            "color": loss_color_sum / num_views,
+            "scale_vol_reg": loss_scale_vol_reg_sum / num_views,
         },
         "rendered_rgb": rendered_rgbs_to_log[0],
         "gt_rgb": gt_rgbs_to_log[0],
         "view_indices": view_indices.detach().cpu(),
         "scene_stats": flat_scene_stats,
+        "flat_scene_to_save": flat_scene_to_save,
     }
 
     # return {
@@ -635,132 +747,19 @@ def train_one_group(
             device=device,
         )
 
-        losses = info["losses"]
-
         step_logs.append({
             "scene_name": scene_name,
-            "total": losses["total"].item(),
-            "photo": float(losses["photo"].item()) if "photo" in losses else None,
-            "offset_reg": float(losses["offset_reg"].item()) if "offset_reg" in losses else None,
+            "total": info["losses"]["total"].item(),
+            "losses": info["losses"],
             "rendered_rgb": info["rendered_rgb"],
             "gt_rgb": info["gt_rgb"],
             "view_indices": info["view_indices"],
             "scene_stats": info.get("scene_stats", {}),
+            "flat_scene_to_save": info.get("flat_scene_to_save", None),
         })
         # break  # for debugging, remove this in actual training
 
     return step_logs
-
-@torch.no_grad()
-def verify_scene(
-    decoder,
-    scene_name: str,
-    scene_cache: Dict[str, Any],
-    output_dir: str,
-    epoch: int,
-    view_indices: list[int],
-    render_chunk_size: int = 2,
-):
-    decoder.eval()
-
-    dec_in = scene_cache["decoder_inputs"]
-    gt_images = scene_cache["images"]       # [V,3,H,W]
-    intrinsics = scene_cache["intrinsics"]
-    extrinsics = scene_cache["extrinsics"]
-    camera_xyz = scene_cache["camera_xyz"]
-
-    V, _, H, W = gt_images.shape
-    view_indices = select_valid_view_indices(V, view_indices)
-    view_tensor = torch.tensor(view_indices, device=gt_images.device, dtype=torch.long)
-
-    decoder_out = decoder(
-        anchor_xyz=dec_in["anchor_xyz"],
-        dino_feat=dec_in["dino_feat"],
-        confidence=dec_in["confidence"],
-        cov_diag=dec_in["cov_diag"],
-    )
-
-    pred_rgb, pred_depth, flat_scene = render_views_from_decoder_output(
-        decoder_out=decoder_out,
-        intrinsics=intrinsics,
-        extrinsics=extrinsics,
-        image_hw=(H, W),
-        view_indices=view_tensor,
-        chunk_size=render_chunk_size,
-    )
-
-    gt_rgb = gt_images[view_tensor]
-
-    l1 = F.l1_loss(pred_rgb, gt_rgb).item()
-
-    scene_dir = os.path.join(output_dir, "verification", f"epoch_{epoch:04d}", scene_name)
-    ensure_dir(scene_dir)
-
-    save_gaussian_scene_npz(
-        flat_scene,
-        os.path.join(scene_dir, f"gaussian_scene_epoch_{epoch:04d}.npz"),
-    )
-
-    for local_i, view_idx in enumerate(view_indices):
-        save_tensor_image(gt_rgb[local_i], os.path.join(scene_dir, f"view_{view_idx:04d}_gt.png"))
-        save_tensor_image(pred_rgb[local_i], os.path.join(scene_dir, f"view_{view_idx:04d}_pred.png"))
-        save_diff_image(
-            pred_rgb[local_i],
-            gt_rgb[local_i],
-            os.path.join(scene_dir, f"view_{view_idx:04d}_diff.png"),
-        )
-
-    metrics = {
-        "scene_name": scene_name,
-        "epoch": epoch,
-        "num_views": len(view_indices),
-        "l1": l1,
-    }
-    save_json(metrics, os.path.join(scene_dir, "metrics.json"))
-    return metrics
-
-@torch.no_grad()
-def verify_scenes(
-    decoder,
-    scene_caches: Dict[str, Dict[str, Any]],
-    output_dir: str,
-    epoch: int,
-    view_indices: list[int],
-    render_chunk_size: int = 2,
-):
-    all_metrics = []
-
-    for scene_name, scene_cache in scene_caches.items():
-        try:
-            metrics = verify_scene(
-                decoder=decoder,
-                scene_name=scene_name,
-                scene_cache=scene_cache,
-                output_dir=output_dir,
-                epoch=epoch,
-                view_indices=view_indices,
-                render_chunk_size=render_chunk_size,
-            )
-            all_metrics.append(metrics)
-            print(f"[VERIFY] scene={scene_name} l1={metrics['l1']:.6f}")
-        except Exception as e:
-            print(f"[VERIFY][WARN] scene={scene_name} failed: {e}")
-
-    summary = {
-        "epoch": epoch,
-        "num_scenes": len(all_metrics),
-        "mean_l1": float(np.mean([m["l1"] for m in all_metrics])) if len(all_metrics) > 0 else None,
-        "scenes": all_metrics,
-    }
-
-    summary_dir = os.path.join(output_dir, "verification", f"epoch_{epoch:04d}")
-    ensure_dir(summary_dir)
-    save_json(summary, os.path.join(summary_dir, "summary.json"))
-
-    if summary["mean_l1"] is not None:
-        print(f"[VERIFY] epoch={epoch:04d} mean_l1={summary['mean_l1']:.6f}")
-
-    return summary
 
 def chunk_list(items, chunk_size):
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
@@ -774,6 +773,8 @@ def prepare_scene_cache(
 ):
     ensure_dir(output_dir)
 
+    print(f"preparing scene: image_paths={image_paths}")
+
     with torch.no_grad():
         prediction = model.inference(
             image_paths,
@@ -781,7 +782,9 @@ def prepare_scene_cache(
             export_format="none",
         )
 
+    # start = time.time()
     voxel_dict = voxelizer.voxelize_prediction(prediction)
+    # print(f"Voxelization done. Time: {time.time() - start:.2f} seconds. Num voxels: {voxel_dict['num_voxels']}")
 
     if voxel_dict["num_voxels"] == 0:
         raise RuntimeError("Voxelization returned zero voxels.")
@@ -800,6 +803,12 @@ def prepare_scene_cache(
     else:
         raise ValueError(f"Unsupported extrinsics shape: {extrinsics.shape}")
 
+    sky_mask = None
+    if getattr(prediction, "sky_mask", None) is not None:
+        sky_mask = torch.from_numpy(prediction.sky_mask).bool()   # [V,H,W]
+
+    print(f"prepare_scene_cache: sky_mask shape={sky_mask.shape} dtype={sky_mask.dtype} device={sky_mask.device}" if sky_mask is not None else "prepare_scene_cache: no sky_mask")
+
     return {
         "prediction": prediction,
         "voxel_dict": voxel_dict,
@@ -809,6 +818,7 @@ def prepare_scene_cache(
         "extrinsics": extrinsics,
         "image_paths": image_paths,
         "camera_xyz": camera_xyz,
+        "sky_mask": sky_mask,
     }
 
 @torch.no_grad()
@@ -862,6 +872,7 @@ def verify_scene_no_cache(
             dino_feat=decoder_inputs["dino_feat"],
             confidence=decoder_inputs["confidence"],
             cov_diag=decoder_inputs["cov_diag"],
+            voxel_colors=decoder_inputs["voxel_colors"],
         )
 
         pred_rgb, pred_depth, flat_scene = render_views_from_decoder_output(
@@ -1054,7 +1065,7 @@ def main():
         conf_percentile=args.conf_percentile,
         truncation_band=args.truncation_band,
         feat_mode=args.feat_mode,
-        feat_dim_out=args.feat_dim_out,
+        # feat_dim_out=args.feat_dim_out,
     )
 
     # 用第一個 scene warmup，拿 dino_dim
@@ -1076,6 +1087,7 @@ def main():
         dino_dim=dino_dim,
         hidden_dim=args.hidden_dim,
         num_gaussians=args.num_gaussians,
+        voxel_size=args.voxel_size,
     ).to(device)
 
     optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
@@ -1102,6 +1114,7 @@ def main():
 
     global_step = 0
     for epoch in range(start_epoch, args.epochs + 1):
+        last_train_log = None
         print(f"\n[INFO] Epoch {epoch:04d}/{args.epochs}")
         np.random.shuffle(scene_groups)
 
@@ -1135,6 +1148,8 @@ def main():
                 views_per_step=args.views_per_step,
                 device=device,
             )
+            if len(logs) > 0:
+                last_train_log = logs[-1]
 
             avg_total = np.mean([x["total"] for x in logs])
             print(f"[INFO] Group {group_idx+1} avg_total={avg_total:.6f}")
@@ -1149,10 +1164,15 @@ def main():
                         "train/loss_total": log_item["total"],
                     }
 
-                    if log_item["photo"] is not None:
-                        wandb_log["train/loss_photo"] = log_item["photo"]
-                    if log_item["offset_reg"] is not None:
-                        wandb_log["train/loss_offset_reg"] = log_item["offset_reg"]
+                    # save all loss in log_item that are not None
+                    for k, v in log_item["losses"].items():
+                        # print(f"[DEBUG] loss {k} = {v}")
+                        if v is not None:
+                            wandb_log[f"train/loss_{k}"] = v
+                    # if log_item["photo"] is not None:
+                    #     wandb_log["train/loss_photo"] = log_item["photo"]
+                    # if log_item["offset_reg"] is not None:
+                    #     wandb_log["train/loss_offset_reg"] = log_item["offset_reg"]
 
                     wandb_log.update({
                         f"train/{k}": v for k, v in log_item.get("scene_stats", {}).items()
@@ -1193,6 +1213,17 @@ def main():
                 output_dir=args.output_dir,
                 keep_last_k=args.keep_last_k,
             )
+            if (
+                last_train_log is not None
+                and last_train_log.get("flat_scene_to_save", None) is not None
+            ):
+                save_recent_training_ply(
+                    flat_scene=last_train_log["flat_scene_to_save"],
+                    output_dir=args.output_dir,
+                    epoch=epoch,
+                    scene_name=last_train_log["scene_name"],
+                    keep_last_k=10,
+                )
         
         if epoch % args.val_every == 0:
             val_l1_list = []

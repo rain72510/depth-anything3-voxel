@@ -235,6 +235,8 @@ class SparseVoxelizer:
 
         assert Ntok == Hf * Wf, f"Ntok={Ntok}, expected {Hf * Wf} from image_hw={image_hw}, patch={patch}"
 
+        print(f"Before cut from 3072 to feat_dim_out={self.feat_dim_out}, feat_tokens shape: {feat_tokens.shape}")
+
         # 2. optional dim truncation (先切，再 gather)
         if self.feat_dim_out is not None and self.feat_dim_out < C:
             feat_tokens = feat_tokens[..., :self.feat_dim_out]

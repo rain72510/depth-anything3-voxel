@@ -197,23 +197,31 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         if "colmap" in export_format:
             assert isinstance(image[0], str), "`image` must be image paths for COLMAP export."
 
+        # start = time.time()
         # Preprocess images
         imgs_cpu, extrinsics, intrinsics = self._preprocess_inputs(
             image, extrinsics, intrinsics, process_res, process_res_method
         )
+        # print(f"_preprocess_inputs Done. Time: {time.time() - start:.2f} seconds.")
 
         # Prepare tensors for model
+        # start = time.time()
         imgs, ex_t, in_t = self._prepare_model_inputs(imgs_cpu, extrinsics, intrinsics)
+        # print(f"_prepare_model_inputs Done. Time: {time.time() - start:.2f} seconds.")
 
         # Normalize extrinsics
+        # start = time.time()
         ex_t_norm = self._normalize_extrinsics(ex_t.clone() if ex_t is not None else None)
+        # print(f"_normalize_extrinsics Done. Time: {time.time() - start:.2f} seconds.")
 
         # Run model forward pass
         export_feat_layers = list(export_feat_layers) if export_feat_layers is not None else []
 
+        # start = time.time()
         raw_output = self._run_model_forward(
             imgs, ex_t_norm, in_t, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
         )
+        # print(f"_run_model_forward Done. Time: {time.time() - start:.2f} seconds.")
 
         # Convert raw output to prediction
 
@@ -246,15 +254,22 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # print(raw_output.aux.keys())
 
+        # start = time.time()
         prediction = self._convert_to_prediction(raw_output)
+        # print(f"_convert_to_prediction Done. Time: {time.time() - start:.2f} seconds.")
 
         # Align prediction to extrinsincs
+        # start = time.time()
         prediction = self._align_to_input_extrinsics_intrinsics(
             extrinsics, intrinsics, prediction, align_to_input_ext_scale
         )
+        # print(f"_align_to_input_extrinsics_intrinsics Done. Time: {time.time() - start:.2f} seconds.")
+
 
         # Add processed images for visualization
+        # start = time.time()
         prediction = self._add_processed_images(prediction, imgs_cpu)
+        # print(f"_add_processed_images Done. Time: {time.time() - start:.2f} seconds.")
 
         prediction.raw_feats = raw_output.get("feats", None)
 

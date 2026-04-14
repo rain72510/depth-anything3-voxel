@@ -292,13 +292,13 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         #         else:
         #             print(f"Gaussians field '{key}': type {type(value)}")
 
-        # prediction = self._voxelize(  
-        #     prediction,  
-        #     max_depth=getattr(self, '_voxel_max_depth', 50.0),  
-        #     voxel_size=getattr(self, '_voxel_size', 0.4),  
-        #     conf_percentile=getattr(self, '_voxel_conf_percentile', 40.0),  
-        #     truncation_band=getattr(self, '_voxel_truncation_band', 0.5)  
-        # )  
+        prediction = self._voxelize(  
+            prediction,  
+            max_depth=getattr(self, '_voxel_max_depth', 50.0),  
+            voxel_size=getattr(self, '_voxel_size', 0.4),  
+            conf_percentile=getattr(self, '_voxel_conf_percentile', 30.0),  
+            truncation_band=getattr(self, '_voxel_truncation_band', 0.5)  
+        )  
 
         # voxel_dict = prediction.aux['voxel']
 
@@ -314,7 +314,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # voxel_to_gaussian_model = VoxelToGaussianModel(decoder).to(device)
 
-        return prediction
+        # return prediction
 
         # Export if requested
         if export_dir is not None:

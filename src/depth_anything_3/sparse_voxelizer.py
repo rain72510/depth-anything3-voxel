@@ -327,3 +327,84 @@ class SparseVoxelizer:
         N = E.shape[0]
         bottom = torch.tensor([0, 0, 0, 1], device=E.device, dtype=E.dtype).view(1, 1, 4).expand(N, 1, 4)
         return torch.cat([E, bottom], dim=1)   # (N, 4, 4)
+    
+
+
+import os
+import numpy as np
+
+def export_voxel_centers_npz_and_glb(
+    voxel_dict,
+    out_path_glb: str,
+    use_mean_points: bool = True,
+    save_npz: bool = True,
+    sphere_radius: float = None,
+):
+    """
+    voxel_dict: voxelize_prediction(...) 的輸出
+    use_mean_points:
+        True  -> 用 voxel_mean_points
+        False -> 用幾何 voxel center = (idx + 0.5) * voxel_size
+    sphere_radius:
+        None  -> 自動設成 voxel_size * 0.15
+    """
+
+    try:
+        import trimesh
+    except ImportError:
+        raise ImportError("Please install trimesh: pip install trimesh")
+
+    voxel_size = float(voxel_dict["voxel_size"])
+
+    if use_mean_points:
+        centers = voxel_dict["voxel_mean_points"]
+    else:
+        centers = (voxel_dict["voxel_indices"].float() + 0.5) * voxel_size
+
+    if torch.is_tensor(centers):
+        centers_np = centers.detach().cpu().numpy()
+    else:
+        centers_np = np.asarray(centers)
+
+    colors = voxel_dict.get("voxel_colors", None)
+    if colors is not None:
+        if torch.is_tensor(colors):
+            colors_np = colors.detach().cpu().numpy()
+        else:
+            colors_np = np.asarray(colors)
+
+        # 若顏色是 0~1，轉成 uint8
+        if colors_np.dtype != np.uint8:
+            colors_np = np.clip(colors_np, 0.0, 1.0)
+            colors_np = (colors_np * 255).astype(np.uint8)
+    else:
+        colors_np = np.tile(np.array([[255, 0, 0]], dtype=np.uint8), (centers_np.shape[0], 1))
+
+    # ===== 先存 npz =====
+    if save_npz:
+        npz_path = os.path.splitext(out_path_glb)[0] + ".npz"
+        np.savez_compressed(
+            npz_path,
+            centers=centers_np,
+            colors=colors_np,
+            voxel_size=voxel_size,
+        )
+        print(f"[INFO] Saved voxel centers npz to: {npz_path}")
+
+    # ===== 存 glb =====
+    # 最穩的是把每個 center 畫成小球；viewer 相容性通常比 point cloud 好
+    if sphere_radius is None:
+        sphere_radius = voxel_size * 0.15
+
+    scene = trimesh.Scene()
+
+    for i in range(centers_np.shape[0]):
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=sphere_radius)
+        sphere.visual.vertex_colors = np.tile(
+            np.append(colors_np[i], 255), (sphere.vertices.shape[0], 1)
+        )
+        sphere.apply_translation(centers_np[i])
+        scene.add_geometry(sphere)
+
+    scene.export(out_path_glb)
+    print(f"[INFO] Saved voxel centers glb to: {out_path_glb}")

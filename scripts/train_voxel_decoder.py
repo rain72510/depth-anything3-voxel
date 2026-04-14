@@ -19,7 +19,7 @@ from depth_anything_3.api import DepthAnything3
 
 # currently no wrapper
 # 你自己的 voxelizer 與 decoder
-from depth_anything_3.sparse_voxelizer import SparseVoxelizer
+from depth_anything_3.sparse_voxelizer import SparseVoxelizer, export_voxel_centers_npz_and_glb
 from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
 
 from types import SimpleNamespace
@@ -278,20 +278,32 @@ def save_gaussian_scene_npz(scene: Dict[str, torch.Tensor], path: str):
         colors=scene["colors"].detach().cpu().numpy(),
     )
 
+def masked_l1_loss(pred, gt, valid_mask, eps=1e-8):
+    # pred, gt: [B,3,H,W]
+    # valid_mask: [B,H,W] or [B,1,H,W], True=keep
+    if valid_mask.ndim == 3:
+        valid_mask = valid_mask.unsqueeze(1)
+    valid_mask = valid_mask.float()
+
+    diff = (pred - gt).abs() * valid_mask
+    denom = valid_mask.sum() * pred.shape[1]
+    return diff.sum() / denom.clamp_min(eps)
 
 def compute_photometric_loss(
     decoder_out: Dict[str, torch.Tensor],
     voxel_dict: Dict[str, Any],
     rendered_rgb: torch.Tensor,   # [v,3,H,W]
     gt_rgb: torch.Tensor,         # [v,3,H,W]
+    valid_mask=None,   # [v,H,W], True=non-sky
     lambda_photo: float = 1.0,
     lambda_color: float = 0.05,
     lambda_offset: float = 1e-2,
-    lambda_scale: float = 1e-3,
+    lambda_scale: float = 1e-1,
     lambda_opacity: float = 1e-2,
     lambda_anchor: float = 1e-4,
     lambda_disp: float = 1e-3,
-    lambda_dssim: float = 0.02,
+    # lambda_dssim: float = 0.02,
+    lambda_dssim: float = 0,
     lambda_scale_vol: float = 1e-3,
 ) -> Dict[str, torch.Tensor]:
     losses = {}
@@ -316,8 +328,11 @@ def compute_photometric_loss(
     # print(f"gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}, "
     #       f"min={gt_rgb.min().item():.4f}, max={gt_rgb.max().item():.4f}")
 
-
-    losses["photo"] = lambda_photo * F.l1_loss(rendered_rgb, gt_rgb)
+    if valid_mask is None:
+        losses["photo"] = lambda_photo * F.l1_loss(rendered_rgb, gt_rgb)
+    else:
+        losses["photo"] = lambda_photo * masked_l1_loss(rendered_rgb, gt_rgb, valid_mask)
+    # losses["photo"] = lambda_photo * F.l1_loss(rendered_rgb, gt_rgb)
 
     # for k, v in decoder_out.items():
     #     print(f"decoder_out[{k}]: shape={v.shape}, dtype={v.dtype}, device={v.device}, "
@@ -413,6 +428,10 @@ def build_renderer_gaussians(flat_scene: Dict[str, torch.Tensor]):
         # harmonics=harmonics,               # [1, M, 3, 9]
         harmonics=colors.unsqueeze(0),              # [1, M, 3]
     )
+
+    for k, v in gaussian.__dict__.items():
+        print(f"gaussian.{k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, "
+              f"min={v.min().item():.4f}, max={v.max().item():.4f}")
     return gaussian
 
 def save_flat_scene_as_ply(
@@ -592,6 +611,7 @@ def train_one_step_on_scene(
     intrinsics = scene_cache["intrinsics"]    # [V,3,3]
     extrinsics = scene_cache["extrinsics"]    # [V,4,4] or [V,3,4]
     camera_xyz = scene_cache["camera_xyz"]      # [V,3]
+    sky_mask_all = scene_cache["sky_mask"]   # [V,H,W]
 
 
     gt_images = (
@@ -621,6 +641,7 @@ def train_one_step_on_scene(
     loss_scale_vol_reg_sum = 0.0
     rendered_rgbs_to_log = []
     gt_rgbs_to_log = []
+    sky_masks_to_log = []
 
     flat_scene_stats = None
     
@@ -651,6 +672,20 @@ def train_one_step_on_scene(
         # rendered_rgbs.append(rendered_rgb)
         gt_rgb = gt_images[view:view+1]
         gt_rgb = gt_rgb.to(rendered_rgb.device)
+        sky_mask = sky_mask_all[view:view+1].to(rendered_rgb.device)   # [1,H,W]
+        valid_mask = ~sky_mask
+
+        
+        if rendered_rgb.ndim == 3:
+            rendered_rgb = rendered_rgb.unsqueeze(0) 
+
+        # print sky mask size, dtype, device, and some stats for debugging
+        # print(f"sky_mask: shape={sky_mask.shape}, dtype={sky_mask.dtype}, device={sky_mask.device}, "
+        #       f"num_sky_pixels={sky_mask.sum().item()}, num_valid_pixels={valid_mask.sum().item()}")
+        # print(f"rendered_rgb: shape={rendered_rgb.shape}, dtype={rendered_rgb.dtype}, device={rendered_rgb.device}, "
+        #       f"min={rendered_rgb.min().item():.4f}, max={rendered_rgb.max().item():.4f}")
+        # print(f"gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}, "
+        #       f"min={gt_rgb.min().item():.4f}, max={gt_rgb.max().item():.4f}")
 
         # start = time.time()
         losses = compute_photometric_loss(
@@ -658,6 +693,7 @@ def train_one_step_on_scene(
             voxel_dict=voxel_dict,
             rendered_rgb=rendered_rgb,
             gt_rgb=gt_rgb,
+            valid_mask=valid_mask,
         )
         # print(f"Compute photometric loss done. Time: {time.time() - start:.2f} seconds.")
 
@@ -674,6 +710,7 @@ def train_one_step_on_scene(
         if i == 0:
             rendered_rgbs_to_log.append(rendered_rgb.detach().cpu())
             gt_rgbs_to_log.append(gt_rgb.detach().cpu())
+            sky_masks_to_log = sky_mask.detach().cpu()
             flat_scene_stats = {
                 "num_gaussians": int(flat_scene["means3D"].shape[0]),
                 "mean_opacity": float(flat_scene["opacity"].mean().item()),
@@ -713,6 +750,7 @@ def train_one_step_on_scene(
         "view_indices": view_indices.detach().cpu(),
         "scene_stats": flat_scene_stats,
         "flat_scene_to_save": flat_scene_to_save,
+        "sky_mask": sky_masks_to_log[0],
     }
 
     # return {
@@ -756,6 +794,7 @@ def train_one_group(
             "view_indices": info["view_indices"],
             "scene_stats": info.get("scene_stats", {}),
             "flat_scene_to_save": info.get("flat_scene_to_save", None),
+            "sky_mask": info.get("sky_mask", None),
         })
         # break  # for debugging, remove this in actual training
 
@@ -763,6 +802,102 @@ def train_one_group(
 
 def chunk_list(items, chunk_size):
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+def build_sky_mask_from_gt(
+    images_u8: np.ndarray,   # [V,H,W,3], uint8
+    depth: np.ndarray,       # [V,H,W]
+    conf: np.ndarray,        # [V,H,W]
+):
+    V, H, W, _ = images_u8.shape
+
+    # 上方區域 prior
+    ys = np.arange(H)[None, :, None]
+    top_mask = ys < int(0.45 * H)
+    top_mask = np.broadcast_to(top_mask, (V, H, W))
+
+    # 顏色條件：偏亮、低飽和
+    img = images_u8.astype(np.float32) / 255.0
+    rgb_max = img.max(axis=-1)
+    rgb_min = img.min(axis=-1)
+    sat = rgb_max - rgb_min
+    bright_low_sat = (rgb_max > 0.6) & (sat < 0.18)
+
+    # 幾何條件：遠 depth 或低 conf
+    valid_depth = np.isfinite(depth) & (depth > 0)
+    if valid_depth.any():
+        depth_thr = np.percentile(depth[valid_depth], 90)
+    else:
+        depth_thr = np.inf
+    far_mask = depth >= depth_thr
+
+    valid_conf = np.isfinite(conf)
+    if valid_conf.any():
+        conf_thr = np.percentile(conf[valid_conf], 25)
+    else:
+        conf_thr = -np.inf
+    low_conf = conf <= conf_thr
+
+    sky_mask = top_mask & bright_low_sat & (far_mask | low_conf)
+    return sky_mask.astype(np.bool_)
+
+def mask_to_uint8_image(mask: torch.Tensor) -> np.ndarray:
+    """
+    mask: [H,W] bool or float
+    return: [H,W,3] uint8
+    """
+    if mask.dtype == torch.bool:
+        x = mask.float()
+    else:
+        x = mask
+    x = x.detach().clamp(0, 1).cpu().numpy()
+    x = (x * 255).astype(np.uint8)
+    x = np.stack([x, x, x], axis=-1)
+    return x
+
+def make_wandb_image_triplet_with_mask(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+    caption: str = "",
+):
+    diff = (pred - gt).abs().mean(dim=0, keepdim=True).repeat(3, 1, 1).clamp(0, 1)
+
+    # print shape, dtype, device, min, max of pred, gt, diff, mask for debugging
+    print(f"pred: shape={pred.shape}, dtype={pred.dtype}, device={pred.device}, min={pred.min().item():.4f}, max={pred.max().item():.4f}")
+    print(f"gt: shape={gt.shape}, dtype={gt.dtype}, device={gt.device}, min={gt.min().item():.4f}, max={gt.max().item():.4f}")
+    print(f"diff: shape={diff.shape}, dtype={diff.dtype}, device={diff.device}, min={diff.min().item():.4f}, max={diff.max().item():.4f}")
+    print(f"mask: shape={mask.shape}, dtype={mask.dtype}, device={mask.device}, min={mask.min().item():.4f}, max={mask.max().item():.4f}")
+    pred_np = tensor_to_uint8_image(pred)
+    gt_np = tensor_to_uint8_image(gt)
+    diff_np = tensor_to_uint8_image(diff)
+    mask_np = mask_to_uint8_image(mask)
+
+    return [
+        wandb.Image(gt_np, caption=f"{caption} | gt"),
+        wandb.Image(pred_np, caption=f"{caption} | pred"),
+        wandb.Image(diff_np, caption=f"{caption} | diff"),
+        wandb.Image(mask_np, caption=f"{caption} | sky_mask"),
+    ]
+
+def load_precomputed_sky_mask(cache_dir: str, images_u8: np.ndarray) -> np.ndarray:
+    sky_mask_path = os.path.join(cache_dir, "sky_mask.npz")
+
+    if not os.path.exists(sky_mask_path):
+        raise FileNotFoundError(
+            f"Precomputed sky mask not found: {sky_mask_path}\n"
+            f"Please run precompute_sky_mask.py first."
+        )
+
+    data = np.load(sky_mask_path)
+    sky_mask = data["sky_mask"].astype(np.bool_)
+
+    expected_shape = images_u8.shape[:3]   # [V,H,W]
+    if tuple(sky_mask.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"Sky mask shape mismatch: got {sky_mask.shape}, expected {expected_shape}"
+        )
+
+    return sky_mask
 
 def prepare_scene_cache(
     model: DepthAnything3,
@@ -773,7 +908,7 @@ def prepare_scene_cache(
 ):
     ensure_dir(output_dir)
 
-    print(f"preparing scene: image_paths={image_paths}")
+    # print(f"preparing scene: image_paths={image_paths}")
 
     with torch.no_grad():
         prediction = model.inference(
@@ -802,12 +937,18 @@ def prepare_scene_cache(
         camera_xyz = extrinsics[:, :3, 3]  # [V,3]
     else:
         raise ValueError(f"Unsupported extrinsics shape: {extrinsics.shape}")
+    
+    sky_mask = load_precomputed_sky_mask(
+        cache_dir=output_dir,
+        images_u8=images,   # must match prediction.processed_images
+    )
 
-    sky_mask = None
-    if getattr(prediction, "sky_mask", None) is not None:
-        sky_mask = torch.from_numpy(prediction.sky_mask).bool()   # [V,H,W]
-
-    print(f"prepare_scene_cache: sky_mask shape={sky_mask.shape} dtype={sky_mask.dtype} device={sky_mask.device}" if sky_mask is not None else "prepare_scene_cache: no sky_mask")
+    # export_voxel_centers_npz_and_glb(
+    #     voxel_dict,
+    #     out_path_glb=f"debug/voxel_centers_{os.path.splitext(os.path.basename(image_paths[0]))[0]}.glb",
+    #     use_mean_points=False,   # 看你要 mean point 還是 grid center
+    #     save_npz=True,
+    # )
 
     return {
         "prediction": prediction,
@@ -818,7 +959,7 @@ def prepare_scene_cache(
         "extrinsics": extrinsics,
         "image_paths": image_paths,
         "camera_xyz": camera_xyz,
-        "sky_mask": sky_mask,
+        "sky_mask": torch.from_numpy(sky_mask),   # [V,H,W], bool
     }
 
 @torch.no_grad()
@@ -829,6 +970,7 @@ def verify_scene_no_cache(
     image_paths,
     scene_name,
     output_dir,
+    cache_root,
     epoch,
     device,
     view_indices=(0,10,20),
@@ -837,38 +979,44 @@ def verify_scene_no_cache(
 
     print(f"[VERIFY] preparing scene {scene_name}")
 
-    # 1 DAv3 inference
-    prediction = model.inference(
-        image_paths,
+    prediction = model.inference(image_paths)
+
+    # sky_mask_np = build_sky_mask_from_gt(
+    #     prediction.processed_images,
+    #     prediction.depth,
+    #     prediction.conf,
+    # )
+
+    sky_mask_np = load_precomputed_sky_mask(
+        cache_dir=os.path.join(cache_root, scene_name),
+        images_u8=prediction.processed_images,
     )
 
-    # gt_images = prediction.processed_images.permute(0,3,1,2)   # V,3,H,W
-    
     gt_images = (
         torch.from_numpy(prediction.processed_images)
         .permute(0,3,1,2)
         .contiguous()
         .float() / 255.0
     )
-    intrinsics = torch.from_numpy(prediction.intrinsics).float().to(device)  # [V,3,3]
-    extrinsics = torch.from_numpy(prediction.extrinsics).float().to(device)  # likely [V,4,
+
+    intrinsics = torch.from_numpy(prediction.intrinsics).float().to(device)
+    extrinsics = torch.from_numpy(prediction.extrinsics).float().to(device)
 
     V, _, H, W = gt_images.shape
+    valid_view_indices = select_valid_view_indices(V, list(view_indices))
+    view_tensor = torch.tensor(valid_view_indices, device=device, dtype=torch.long)
 
-    # 2 voxelize
     voxel_dict = voxelizer.voxelize_prediction(prediction)
-
-    # 3 build decoder input
     decoder_inputs = build_decoder_inputs(voxel_dict, device=device)
-    camera_xyz = extrinsics[:, :3, 3].to(device)  # [V,3]
+    camera_xyz = extrinsics[:, :3, 3].to(device)
 
-    # decoder_outs = []
     rendered_rgbs = []
+    flat_scene = None
 
-    for view in view_indices:
+    for view in valid_view_indices:
         decoder_out = decoder(
             anchor_xyz=decoder_inputs["anchor_xyz"],
-            camera_xyz=camera_xyz[view:view+1],   # [1, 3]
+            camera_xyz=camera_xyz[view:view+1],
             dino_feat=decoder_inputs["dino_feat"],
             confidence=decoder_inputs["confidence"],
             cov_diag=decoder_inputs["cov_diag"],
@@ -880,31 +1028,34 @@ def verify_scene_no_cache(
             intrinsics=intrinsics,
             extrinsics=extrinsics,
             image_hw=(H, W),
-            view_indices=[view],   # 只 render 這個 view
+            view_indices=[view],
         )
 
-        # decoder_outs.append(decoder_out)
-        rendered_rgbs.append(pred_rgb)
+        rendered_rgbs.append(pred_rgb)   # [3,H,W]
 
-    # for k in decoder_outs[0].keys():
-    #     decoder_outs[0][k] = torch.cat([d[k] for d in decoder_outs], dim=0)  # now decoder_outs[0][k] has shape [v, ...]
-    # del decoder_outs[1:]  # free memory
-    # decoder_outs = decoder_outs[0]  # we only need one dict since they are now concatenated
-    rendered_rgbs = torch.stack(rendered_rgbs, dim=0)  # [v,3,H,W]
-    
-    view_tensor = torch.tensor(view_indices, device=device)
+    rendered_rgbs = torch.stack(rendered_rgbs, dim=0)   # [v,3,H,W]
 
     gt_images = gt_images.to(device)
-    gt_rgb = gt_images[view_tensor]
+    gt_rgb = gt_images[view_tensor]                     # [v,3,H,W]
 
-    # 6 metric
-    l1 = F.l1_loss(rendered_rgbs, gt_rgb).item()
+    sky_mask = torch.from_numpy(sky_mask_np).to(device) # [V,H,W]
+    sky_mask = sky_mask[view_tensor]                    # [v,H,W]
+    valid_mask = ~sky_mask
 
-    # 7 save
+    l1 = masked_l1_loss(rendered_rgbs, gt_rgb, valid_mask).item()
+
     scene_dir = os.path.join(output_dir, "verification", f"epoch_{epoch:04d}", scene_name)
     os.makedirs(scene_dir, exist_ok=True)
 
-    for i, view_idx in enumerate(view_indices):
+    # print gt_rgb, rendered_rgbs
+    print(f"[VERIFY] gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}, "
+          f"min={gt_rgb.min().item():.4f}, max={gt_rgb.max().item():.4f}")
+    print(f"[VERIFY] rendered_rgbs: shape={rendered_rgbs.shape}, dtype={rendered_rgbs.dtype}, device={rendered_rgbs.device}, "
+          f"min={rendered_rgbs.min().item():.4f}, max={rendered_rgbs.max().item():.4f}")
+    print(f"[VERIFY] sky_mask: shape={sky_mask.shape}, dtype={sky_mask.dtype}, device={sky_mask.device}, "
+          f"num_sky_pixels={sky_mask.sum().item()}, num_valid_pixels={valid_mask.sum().item()}")
+
+    for i, view_idx in enumerate(valid_view_indices):
         save_tensor_image(gt_rgb[i], f"{scene_dir}/view_{view_idx}_gt.png")
         save_tensor_image(rendered_rgbs[i], f"{scene_dir}/view_{view_idx}_pred.png")
         save_diff_image(rendered_rgbs[i], gt_rgb[i], f"{scene_dir}/view_{view_idx}_diff.png")
@@ -914,17 +1065,15 @@ def verify_scene_no_cache(
         os.path.join(scene_dir, "gaussian_scene.npz")
     )
 
-    # valid_view_indices = select_valid_view_indices(V, list(view_indices))
-    # view_tensor = torch.tensor(valid_view_indices, device=device)
-
     print(f"[VERIFY] {scene_name} L1 = {l1:.6f}")
 
     return {
         "scene_name": scene_name,
         "l1": l1,
-        "pred_rgb": pred_rgb.detach().cpu(),
+        "pred_rgb": rendered_rgbs.detach().cpu(),
         "gt_rgb": gt_rgb.detach().cpu(),
-        "view_indices": list(view_indices),
+        "sky_mask": sky_mask.detach().cpu(),
+        "view_indices": valid_view_indices,
         "num_voxels": int(voxel_dict["num_voxels"]),
         "num_gaussians": int(flat_scene["means3D"].shape[0]),
     }
@@ -993,6 +1142,14 @@ def main():
     parser.add_argument("--truncation-band", type=float, default=0.5)
     parser.add_argument("--feat-mode", type=str, default="last2_avg")
     parser.add_argument("--feat-dim-out", type=int, default=128)
+
+    # sky mask
+    parser.add_argument(
+        "--cache-root",
+        type=str,
+        default="output_train_voxel_decoder/cache",
+        help="Fixed cache root for precomputed scene cache such as sky masks",
+    )
 
     # decoder params
     parser.add_argument("--hidden-dim", type=int, default=256)
@@ -1119,12 +1276,14 @@ def main():
         np.random.shuffle(scene_groups)
 
         for group_idx, group in enumerate(scene_groups):
+            # continue
             print(f"[INFO] Loading group {group_idx+1}/{len(scene_groups)} with {len(group)} scenes")
 
             group_cache = {}
             for scene in group:
                 scene_name = scene["scene_name"]
-                scene_out_dir = os.path.join(args.output_dir, "cache", scene_name)
+                # scene_out_dir = os.path.join(args.output_dir, "cache", scene_name)
+                scene_out_dir = os.path.join(args.cache_root, scene_name)
                 try:
                     group_cache[scene_name] = prepare_scene_cache(
                         model=model,
@@ -1190,11 +1349,14 @@ def main():
                         # print(f"[DEBUG] log_item['rendered_rgb'] shape={log_item['rendered_rgb'].shape}, dtype={log_item['rendered_rgb'].dtype}, device={log_item['rendered_rgb'].device}")
                         # print(f"[DEBUG] log_item['gt_rgb'] shape={log_item['gt_rgb'].shape}, dtype={log_item['gt_rgb'].dtype}, device={log_item['gt_rgb'].device}")
                         # pred0 = log_item["rendered_rgb"][0].detach().cpu()
-                        pred0 = log_item["rendered_rgb"].detach().cpu()
+                        pred0 = log_item["rendered_rgb"][0].detach().cpu()
                         gt0 = log_item["gt_rgb"][0].detach().cpu()
-                        imgs = make_wandb_image_triplet(
+                        # print(f"[DEBUG] log_item['sky_mask'] shape={log_item['sky_mask'].shape}, dtype={log_item['sky_mask'].dtype}, device={log_item['sky_mask'].device}")
+                        mask0 = log_item["sky_mask"].detach().cpu()
+                        imgs = make_wandb_image_triplet_with_mask(
                             pred=pred0,
                             gt=gt0,
+                            mask=mask0,
                             caption=f"train step={global_step} scene={log_item['scene_name']}",
                         )
                         wandb_log["train/render_samples"] = imgs
@@ -1236,6 +1398,7 @@ def main():
                     image_paths=scene["image_paths"],
                     scene_name=scene["scene_name"],
                     output_dir=args.output_dir,
+                    cache_root=args.cache_root,
                     epoch=epoch,
                     device=device,
                 )
@@ -1258,16 +1421,18 @@ def main():
                     }
 
                     if args.wandb_log_val_images:
-                        # print(f"[DEBUG] log_item['pred_rgb'] shape={val_info['pred_rgb'].shape}, dtype={val_info['pred_rgb'].dtype}, device={val_info['pred_rgb'].device}")
-                        # print(f"[DEBUG] log_item['gt_rgb'] shape={val_info['gt_rgb'].shape}, dtype={val_info['gt_rgb'].dtype}, device={val_info['gt_rgb'].device}")
-                        # pred0 = val_info["pred_rgb"][0]
-                        # gt rgb is now [3, 3, 336, 504], check it!
+                        # print pred0, gt0, mask0
+                        print(f"[DEBUG] val_info['pred_rgb'] shape={val_info['pred_rgb'].shape}, dtype={val_info['pred_rgb'].dtype}, device={val_info['pred_rgb'].device}")
+                        print(f"[DEBUG] val_info['gt_rgb'] shape={val_info['gt_rgb'].shape}, dtype={val_info['gt_rgb'].dtype}, device={val_info['gt_rgb'].device}")
+                        print(f"[DEBUG] val_info['sky_mask'] shape={val_info['sky_mask'].shape}, dtype={val_info['sky_mask'].dtype}, device={val_info['sky_mask'].device}")
 
-                        pred0 = val_info["pred_rgb"]
+                        pred0 = val_info["pred_rgb"][0]
                         gt0 = val_info["gt_rgb"][0]
-                        val_log[f"val/{val_info['scene_name']}_samples"] = make_wandb_image_triplet(
+                        mask0 = val_info["sky_mask"][0]
+                        val_log[f"val/{val_info['scene_name']}_samples"] = make_wandb_image_triplet_with_mask(
                             pred=pred0,
                             gt=gt0,
+                            mask=mask0,
                             caption=f"val epoch={epoch} scene={val_info['scene_name']}",
                         )
 

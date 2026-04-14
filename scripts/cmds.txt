@@ -64,12 +64,13 @@ WANDB_MODE=online CUDA_VISIBLE_DEVICES=1 python scripts/train_voxel_decoder.py \
   --wandb-log-train-images-every 10 \
   --wandb-log-val-images
 
-WANDB_MODE=online CUDA_VISIBLE_DEVICES=6 python scripts/train_voxel_decoder.py \
+WANDB_MODE=online CUDA_VISIBLE_DEVICES=4 python scripts/train_voxel_decoder.py \
   --dataset-root datasets/waymo \
   --output-dir output_train_voxel_decoder \
+  --cache-root output_train_voxel_decoder/cache \
   --epochs 200 \
   --voxel-size 0.4 \
-  --views-per-step 6 \
+  --views-per-step 2 \
   --max-depth 50 \
   --conf-percentile 40 \
   --feat-mode last2_avg \
@@ -78,6 +79,19 @@ WANDB_MODE=online CUDA_VISIBLE_DEVICES=6 python scripts/train_voxel_decoder.py \
   --num-gaussians 1 \
   --use-wandb \
   --wandb-project voxel-anchored-3dgs \
-  --wandb-run-name exp08-pre-color-color-input \
+  --wandb-run-name exp10-remove-sky \
   --wandb-log-train-images-every 10 \
   --wandb-log-val-images
+
+  exp10-remove-sky-lambda_scale-1e-1-scale-max-1vsize
+
+docker run --init -it -d \
+  --name liosam-humble-ros2 \
+  -v /etc/localtime:/etc/localtime:ro \
+  -v /etc/timezone:/etc/timezone:ro \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v /home/rain/datasets/out-ros2:/out \
+  -e DISPLAY=$DISPLAY \
+  --runtime=nvidia --gpus all \
+  liosam-humble-ros2 \
+  bash

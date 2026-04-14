@@ -88,6 +88,7 @@ def export_to_glb(
     Returns:
         Path to the exported ``scene.glb`` file.
     """
+    # num_max_points = 100_000_000
     # 1) Use prediction.processed_images, which is already processed image data
     assert (
         prediction.processed_images is not None
@@ -113,8 +114,17 @@ def export_to_glb(
     images_u8 = prediction.processed_images  # (N,H,W,3) uint8
 
     # 2) Sky processing (if sky_mask is provided)
+    # print sky_mask stats for debugging
+    print(f"Checking sky mask")
     if getattr(prediction, "sky_mask", None) is not None:
         set_sky_depth(prediction, prediction.sky_mask, sky_depth_def)
+        print(f"Sky mask applied with sky_depth_def={sky_depth_def}")
+        print(
+            f"Sky mask stats: total pixels={prediction.sky_mask.size}, "
+            f"sky pixels={prediction.sky_mask.sum()}, "
+            f"non-sky pixels={(~prediction.sky_mask).sum()}"
+        )
+    print(f"finished sky mask check")
 
     # 3) Confidence threshold (if no conf, then no filtering)
     if filter_black_bg:
@@ -129,13 +139,19 @@ def export_to_glb(
         ensure_thresh_percentile,
     )
 
+    # print confidence stats for debugging
+    conf_pixels = prediction.conf
+    print(f"Confidence stats: min={conf_pixels.min():.3f}, max={conf_pixels.max():.3f}, mean={conf_pixels.mean():.3f}, threshold={conf_thr:.3f}, above_threshold={(conf_pixels >= conf_thr).sum()/conf_pixels.size:.2%}")
+
+
     # 4) Back-project to world coordinates and get colors (world frame)
     points, colors = _depths_to_world_points_with_colors(
         prediction.depth,
         prediction.intrinsics,
         prediction.extrinsics,  # w2c
         images_u8,
-        prediction.conf,
+        # prediction.conf,
+        None,
         conf_thr,
     )
 

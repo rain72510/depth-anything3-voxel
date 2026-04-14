@@ -100,6 +100,7 @@ def export_ply(
     elements[:] = list(map(tuple, attributes))
     path.parent.mkdir(exist_ok=True, parents=True)
     PlyData([PlyElement.describe(elements, "vertex")]).write(path)
+    print(f"Saved Gaussian PLY to {path}")
 
 
 def inverse_sigmoid(x):

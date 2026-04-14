@@ -76,6 +76,7 @@ def render_3dgs(
         shs = (
             gaussian_sh_coefficients.squeeze(-1).sigmoid().contiguous()
         )  # (b, g, c), normed to (0, 1)
+        shs = gaussian_sh_coefficients.contiguous().clamp(0.0, 1.0)
 
     h, w = image_shape
 

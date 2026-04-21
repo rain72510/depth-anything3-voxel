@@ -19,7 +19,7 @@ from depth_anything_3.api import DepthAnything3
 
 # currently no wrapper
 # 你自己的 voxelizer 與 decoder
-from depth_anything_3.sparse_voxelizer import SparseVoxelizer, export_voxel_centers_npz_and_glb
+from depth_anything_3.sparse_voxelizer import SparseVoxelizer
 from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
 
 from types import SimpleNamespace
@@ -304,7 +304,7 @@ def compute_photometric_loss(
     lambda_disp: float = 1e-3,
     # lambda_dssim: float = 0.02,
     lambda_dssim: float = 0,
-    lambda_scale_vol: float = 1e-3,
+    lambda_scale_vol: float = 1e-2,
 ) -> Dict[str, torch.Tensor]:
     losses = {}
 
@@ -429,9 +429,9 @@ def build_renderer_gaussians(flat_scene: Dict[str, torch.Tensor]):
         harmonics=colors.unsqueeze(0),              # [1, M, 3]
     )
 
-    for k, v in gaussian.__dict__.items():
-        print(f"gaussian.{k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, "
-              f"min={v.min().item():.4f}, max={v.max().item():.4f}")
+    # for k, v in gaussian.__dict__.items():
+    #     print(f"gaussian.{k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, "
+    #           f"min={v.min().item():.4f}, max={v.max().item():.4f}")
     return gaussian
 
 def save_flat_scene_as_ply(
@@ -622,9 +622,56 @@ def train_one_step_on_scene(
     )
     if gt_images.max() > 1.0:
         gt_images = gt_images / 255.0
+
     V, C, H, W = gt_images.shape
-    num_views = min(views_per_step, V)
-    view_indices = torch.randperm(V, device=device)[:num_views]
+    if V == 0:
+        raise RuntimeError("No supervision views available in scene_cache.")
+
+    supervision_global = scene_cache.get("supervision_indices", None)
+    input_global = scene_cache.get("input_indices", None)
+
+    if supervision_global is not None and input_global is not None:
+        input_global_set = set(input_global)
+
+        seen_local = [i for i, g in enumerate(supervision_global) if g in input_global_set]
+        novel_local = [i for i, g in enumerate(supervision_global) if g not in input_global_set]
+
+        target_seen = views_per_step // 2
+        target_novel = views_per_step - target_seen
+
+        sampled = []
+
+        if len(seen_local) > 0:
+            num_seen = min(target_seen, len(seen_local))
+            seen_perm = torch.randperm(len(seen_local), device=device)[:num_seen]
+            sampled.extend([seen_local[i] for i in seen_perm.cpu().tolist()])
+
+        if len(novel_local) > 0:
+            num_novel = min(target_novel, len(novel_local))
+            novel_perm = torch.randperm(len(novel_local), device=device)[:num_novel]
+            sampled.extend([novel_local[i] for i in novel_perm.cpu().tolist()])
+
+        # 如果某一邊不夠，就從另一邊補足
+        if len(sampled) < min(views_per_step, V):
+            remaining_pool = [i for i in range(V) if i not in sampled]
+            need = min(views_per_step, V) - len(sampled)
+            if len(remaining_pool) > 0:
+                extra_perm = torch.randperm(len(remaining_pool), device=device)[:need]
+                sampled.extend([remaining_pool[i] for i in extra_perm.cpu().tolist()])
+
+        view_indices = torch.tensor(sampled, device=device, dtype=torch.long)
+        num_views = len(sampled)
+    else:
+        num_views = min(views_per_step, V)
+        view_indices = torch.randperm(V, device=device)[:num_views]
+
+    num_seen_sampled = 0
+    num_novel_sampled = 0
+    if supervision_global is not None and input_global is not None:
+        input_global_set = set(input_global)
+        sampled_global = [supervision_global[i] for i in view_indices.cpu().tolist()]
+        num_seen_sampled = sum([g in input_global_set for g in sampled_global])
+        num_novel_sampled = len(sampled_global) - num_seen_sampled
 
     # Now we need to select the camera_xyz to input into the decoder.
 
@@ -639,6 +686,7 @@ def train_one_step_on_scene(
     loss_dssim_sum = 0.0
     loss_color_sum = 0.0
     loss_scale_vol_reg_sum = 0.0
+    delta_color_abs_mean_sum = 0.0
     rendered_rgbs_to_log = []
     gt_rgbs_to_log = []
     sky_masks_to_log = []
@@ -679,14 +727,6 @@ def train_one_step_on_scene(
         if rendered_rgb.ndim == 3:
             rendered_rgb = rendered_rgb.unsqueeze(0) 
 
-        # print sky mask size, dtype, device, and some stats for debugging
-        # print(f"sky_mask: shape={sky_mask.shape}, dtype={sky_mask.dtype}, device={sky_mask.device}, "
-        #       f"num_sky_pixels={sky_mask.sum().item()}, num_valid_pixels={valid_mask.sum().item()}")
-        # print(f"rendered_rgb: shape={rendered_rgb.shape}, dtype={rendered_rgb.dtype}, device={rendered_rgb.device}, "
-        #       f"min={rendered_rgb.min().item():.4f}, max={rendered_rgb.max().item():.4f}")
-        # print(f"gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}, "
-        #       f"min={gt_rgb.min().item():.4f}, max={gt_rgb.max().item():.4f}")
-
         # start = time.time()
         losses = compute_photometric_loss(
             decoder_out=decoder_out,
@@ -697,7 +737,6 @@ def train_one_step_on_scene(
         )
         # print(f"Compute photometric loss done. Time: {time.time() - start:.2f} seconds.")
 
-
         total_loss = total_loss + losses["total"]
         loss_photo_sum = loss_photo_sum + losses["photo"].item()
         loss_offset_reg_sum = loss_offset_reg_sum + losses["offset_reg"].item()
@@ -706,6 +745,10 @@ def train_one_step_on_scene(
         loss_opacity_reg_sum = loss_opacity_reg_sum + losses["opacity_reg"].item()
         loss_color_sum = loss_color_sum + losses["color"].item()
         loss_scale_vol_reg_sum = loss_scale_vol_reg_sum + losses["scale_vol_reg"].item()
+        delta_color = decoder_out.get("delta_color", None)
+        if delta_color is not None:
+            dc = delta_color.detach()
+            delta_color_abs_mean_sum += dc.abs().mean().item()
 
         if i == 0:
             rendered_rgbs_to_log.append(rendered_rgb.detach().cpu())
@@ -733,6 +776,12 @@ def train_one_step_on_scene(
     optimizer.step()
     # print(f"Backward and optimizer step done. Time: {time.time() - start:.2f} seconds.")
 
+    delta_color_stats = None
+    if delta_color_abs_mean_sum > 0:
+        delta_color_stats = {
+            "abs_mean": delta_color_abs_mean_sum / num_views,
+        }
+
 
     return {
         "losses": {
@@ -751,6 +800,11 @@ def train_one_step_on_scene(
         "scene_stats": flat_scene_stats,
         "flat_scene_to_save": flat_scene_to_save,
         "sky_mask": sky_masks_to_log[0],
+        "delta_color_stats": delta_color_stats,
+        "sampling_stats": {
+            "num_seen": num_seen_sampled,
+            "num_novel": num_novel_sampled,
+        },
     }
 
     # return {
@@ -763,19 +817,67 @@ def train_one_step_on_scene(
     # }
 
 def train_one_group(
-    decoder: VoxelGaussianDecoder,
-    optimizer: torch.optim.Optimizer,
-    group_scene_caches: dict,
-    views_per_step: int,
-    steps_per_group: int,
-    device: torch.device,
+    decoder,
+    optimizer,
+    group_scenes,
+    model,
+    voxelizer,
+    cache_root,
+    views_per_step,
+    steps_per_group,
+    device,
+    sequence_length,
+    supervision_mode,
 ):
-    scene_names = list(group_scene_caches.keys())
+    scene_names = [s["scene_name"] for s in group_scenes]
+    scene_map = {s["scene_name"]: s for s in group_scenes}
     step_logs = []
 
     for step in range(steps_per_group):
         scene_name = scene_names[step % len(scene_names)]
-        scene_cache = group_scene_caches[scene_name]
+        scene = scene_map[scene_name]
+        all_image_paths = scene["image_paths"]
+        num_scene_views = len(all_image_paths)
+
+        if num_scene_views < 3:
+            print(f"[WARN] Skip scene {scene_name}: only {num_scene_views} view(s)")
+            continue
+
+        if supervision_mode == "even_input_mixed_supervision":
+            effective_sequence_length = min(sequence_length, len(scene["image_paths"]))
+
+            split = sample_even_odd_window(
+                scene["image_paths"],
+                sequence_length=effective_sequence_length,
+            )
+            try:
+                scene_cache = prepare_scene_cache(
+                    model=model,
+                    voxelizer=voxelizer,
+                    input_image_paths=split["input_paths"],
+                    supervision_image_paths=[scene["image_paths"][i] for i in split["window_indices"]],
+                    output_dir=os.path.join(cache_root, scene_name, f"{split['start']:04d}_{split['end']:04d}"),
+                    scene_cache_dir=os.path.join(cache_root, scene_name),
+                    full_scene_num_views=len(scene["image_paths"]),
+                    input_indices=split["input_indices"],
+                    supervision_indices=split["window_indices"],
+                    device=device,
+                )
+            except Exception as e:
+                print(f"[WARN] Skip scene {scene_name} at step {step}: {e}")
+                continue
+        else:
+            scene_cache = prepare_scene_cache(
+                model=model,
+                voxelizer=voxelizer,
+                input_image_paths=scene["image_paths"],
+                output_dir=os.path.join(cache_root, scene_name),
+                scene_cache_dir=os.path.join(cache_root, scene_name),
+                full_scene_num_views=len(scene["image_paths"]),
+                input_indices=list(range(len(scene["image_paths"]))),
+                supervision_indices=list(range(len(scene["image_paths"]))),
+                device=device,
+            )
 
         info = train_one_step_on_scene(
             decoder=decoder,
@@ -795,6 +897,8 @@ def train_one_group(
             "scene_stats": info.get("scene_stats", {}),
             "flat_scene_to_save": info.get("flat_scene_to_save", None),
             "sky_mask": info.get("sky_mask", None),
+            "delta_color_stats": info.get("delta_color_stats", None),
+            "sampling_stats": info.get("sampling_stats", None),
         })
         # break  # for debugging, remove this in actual training
 
@@ -863,10 +967,10 @@ def make_wandb_image_triplet_with_mask(
     diff = (pred - gt).abs().mean(dim=0, keepdim=True).repeat(3, 1, 1).clamp(0, 1)
 
     # print shape, dtype, device, min, max of pred, gt, diff, mask for debugging
-    print(f"pred: shape={pred.shape}, dtype={pred.dtype}, device={pred.device}, min={pred.min().item():.4f}, max={pred.max().item():.4f}")
-    print(f"gt: shape={gt.shape}, dtype={gt.dtype}, device={gt.device}, min={gt.min().item():.4f}, max={gt.max().item():.4f}")
-    print(f"diff: shape={diff.shape}, dtype={diff.dtype}, device={diff.device}, min={diff.min().item():.4f}, max={diff.max().item():.4f}")
-    print(f"mask: shape={mask.shape}, dtype={mask.dtype}, device={mask.device}, min={mask.min().item():.4f}, max={mask.max().item():.4f}")
+    # print(f"pred: shape={pred.shape}, dtype={pred.dtype}, device={pred.device}, min={pred.min().item():.4f}, max={pred.max().item():.4f}")
+    # print(f"gt: shape={gt.shape}, dtype={gt.dtype}, device={gt.device}, min={gt.min().item():.4f}, max={gt.max().item():.4f}")
+    # print(f"diff: shape={diff.shape}, dtype={diff.dtype}, device={diff.device}, min={diff.min().item():.4f}, max={diff.max().item():.4f}")
+    # print(f"mask: shape={mask.shape}, dtype={mask.dtype}, device={mask.device}, min={mask.min().item():.4f}, max={mask.max().item():.4f}")
     pred_np = tensor_to_uint8_image(pred)
     gt_np = tensor_to_uint8_image(gt)
     diff_np = tensor_to_uint8_image(diff)
@@ -899,12 +1003,128 @@ def load_precomputed_sky_mask(cache_dir: str, images_u8: np.ndarray) -> np.ndarr
 
     return sky_mask
 
+def load_precomputed_sky_mask_subset(
+    scene_cache_dir: str,
+    full_num_views: int,
+    selected_indices: list[int],
+):
+    sky_mask_path = os.path.join(scene_cache_dir, "sky_mask.npz")
+
+    if not os.path.exists(sky_mask_path):
+        raise FileNotFoundError(
+            f"Precomputed sky mask not found: {sky_mask_path}\n"
+            f"Please run precompute_sky_mask.py first."
+        )
+
+    data = np.load(sky_mask_path)
+    sky_mask = data["sky_mask"].astype(np.bool_)   # [V,H,W]
+
+    cached_num_views = sky_mask.shape[0]
+
+    if cached_num_views != full_num_views:
+        print(
+            f"[WARN] sky mask num_views mismatch in {scene_cache_dir}: "
+            f"cache={cached_num_views}, current_scene={full_num_views}"
+        )
+
+    if len(selected_indices) == 0:
+        raise ValueError("selected_indices is empty.")
+
+    max_idx = max(selected_indices)
+    min_idx = min(selected_indices)
+
+    if min_idx < 0 or max_idx >= cached_num_views:
+        raise ValueError(
+            f"Sky mask index out of range: min={min_idx}, max={max_idx}, "
+            f"cached_num_views={cached_num_views}"
+        )
+
+    return sky_mask[selected_indices]
+
+def sample_even_odd_window(image_paths, sequence_length, stride=1):
+    num_imgs = len(image_paths)
+    if num_imgs < sequence_length:
+        start = 0
+        end = num_imgs
+    else:
+        max_start = num_imgs - sequence_length
+        start = np.random.randint(0, max_start + 1)
+        end = start + sequence_length
+
+    window_indices = list(range(start, end, stride))
+    input_indices = window_indices[::2]   # 偶數位置
+    target_indices = window_indices[1::2] # 奇數位置
+
+    if len(input_indices) == 0:
+        input_indices = [window_indices[0]]
+    if len(target_indices) == 0:
+        target_indices = [window_indices[-1]]
+
+    input_paths = [image_paths[i] for i in input_indices]
+    target_global_indices = target_indices  # 對原 scene 的 index
+
+    return {
+        "start": start,
+        "end": end,
+        "window_indices": window_indices,
+        "input_indices": input_indices,
+        "target_indices": target_global_indices,
+        "input_paths": input_paths,
+    }
+
+def load_scene_name_list(txt_path: str) -> list[str]:
+    if txt_path is None:
+        return []
+
+    if not os.path.exists(txt_path):
+        raise FileNotFoundError(f"scene list file not found: {txt_path}")
+
+    scene_names = []
+    with open(txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            name = line.strip()
+            if len(name) == 0:
+                continue
+            scene_names.append(name)
+
+    return scene_names
+
+
+def filter_scenes_by_name(
+    scenes: list[dict],
+    selected_scene_names: list[str],
+    mode: str = "restrict",
+) -> list[dict]:
+    selected_set = set(selected_scene_names)
+
+    if mode == "restrict":
+        filtered = [s for s in scenes if s["scene_name"] in selected_set]
+    elif mode == "exclude":
+        filtered = [s for s in scenes if s["scene_name"] not in selected_set]
+    else:
+        raise ValueError(f"Unsupported scene filter mode: {mode}")
+
+    return filtered
+
+def report_missing_scene_names(discovered_scenes: list[dict], requested_scene_names: list[str]):
+    discovered = {s["scene_name"] for s in discovered_scenes}
+    missing = sorted(set(requested_scene_names) - discovered)
+    if len(missing) > 0:
+        print(f"[WARN] {len(missing)} scene(s) from list file were not found in dataset:")
+        for name in missing:
+            print(f"  - {name}")
+
 def prepare_scene_cache(
     model: DepthAnything3,
     voxelizer: SparseVoxelizer,
-    image_paths,
+    input_image_paths,
     output_dir: str,
     device: torch.device,
+    supervision_image_paths=None,
+    scene_cache_dir=None,
+    full_scene_num_views=None,
+    input_indices=None,
+    supervision_indices=None,
 ):
     ensure_dir(output_dir)
 
@@ -912,7 +1132,7 @@ def prepare_scene_cache(
 
     with torch.no_grad():
         prediction = model.inference(
-            image_paths,
+            input_image_paths,
             export_dir=output_dir,
             export_format="none",
         )
@@ -938,28 +1158,99 @@ def prepare_scene_cache(
     else:
         raise ValueError(f"Unsupported extrinsics shape: {extrinsics.shape}")
     
-    sky_mask = load_precomputed_sky_mask(
-        cache_dir=output_dir,
-        images_u8=images,   # must match prediction.processed_images
-    )
+    if supervision_image_paths is None:
+        supervision_prediction = prediction
+        supervision_images = supervision_prediction.processed_images
+        supervision_intrinsics = torch.from_numpy(supervision_prediction.intrinsics).float().to(device)
+        supervision_extrinsics = torch.from_numpy(supervision_prediction.extrinsics).float().to(device)
+        supervision_camera_xyz = supervision_extrinsics[:, :3, 3]
 
-    # export_voxel_centers_npz_and_glb(
-    #     voxel_dict,
-    #     out_path_glb=f"debug/voxel_centers_{os.path.splitext(os.path.basename(image_paths[0]))[0]}.glb",
-    #     use_mean_points=False,   # 看你要 mean point 還是 grid center
-    #     save_npz=True,
-    # )
+        if scene_cache_dir is None:
+            raise ValueError("scene_cache_dir is required to load precomputed sky mask.")
+
+        if full_scene_num_views is None:
+            full_scene_num_views = len(input_image_paths)
+
+        if supervision_indices is None:
+            supervision_indices = list(range(len(supervision_images)))
+
+        try:
+            supervision_sky_mask = load_precomputed_sky_mask_subset(
+                scene_cache_dir=scene_cache_dir,
+                full_num_views=full_scene_num_views,
+                selected_indices=supervision_indices,
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to load sky mask subset for {scene_cache_dir}: {e}")
+            H, W = supervision_images.shape[1:3]
+            supervision_sky_mask = np.zeros(
+                (len(supervision_images), H, W),
+                dtype=np.bool_,
+            )
+    else:
+        with torch.no_grad():
+            supervision_prediction = model.inference(
+                supervision_image_paths,
+                export_format="none",
+            )
+
+        supervision_images = supervision_prediction.processed_images
+        supervision_intrinsics = torch.from_numpy(supervision_prediction.intrinsics).float().to(device)
+        supervision_extrinsics = torch.from_numpy(supervision_prediction.extrinsics).float().to(device)
+        supervision_camera_xyz = supervision_extrinsics[:, :3, 3]
+
+        if scene_cache_dir is None:
+            raise ValueError("scene_cache_dir is required to load precomputed sky mask.")
+        if full_scene_num_views is None:
+            raise ValueError("full_scene_num_views is required for supervision subset mode.")
+        if supervision_indices is None:
+            raise ValueError("supervision_indices is required for supervision subset mode.")
+
+        try:
+            supervision_sky_mask = load_precomputed_sky_mask_subset(
+                scene_cache_dir=scene_cache_dir,
+                full_num_views=full_scene_num_views,
+                selected_indices=supervision_indices,
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to load sky mask subset for {scene_cache_dir}: {e}")
+            H, W = supervision_images.shape[1:3]
+            supervision_sky_mask = np.zeros(
+                (len(supervision_images), H, W),
+                dtype=np.bool_,
+            )
+
+    # return {
+    #     "prediction": prediction,
+    #     "voxel_dict": voxel_dict,
+    #     "decoder_inputs": decoder_inputs,
+    #     "images": images,
+    #     "intrinsics": intrinsics,
+    #     "extrinsics": extrinsics,
+    #     "image_paths": image_paths,
+    #     "camera_xyz": camera_xyz,
+    #     "sky_mask": torch.from_numpy(sky_mask),   # [V,H,W], bool
+    # }
 
     return {
         "prediction": prediction,
         "voxel_dict": voxel_dict,
         "decoder_inputs": decoder_inputs,
-        "images": images,
-        "intrinsics": intrinsics,
-        "extrinsics": extrinsics,
-        "image_paths": image_paths,
-        "camera_xyz": camera_xyz,
-        "sky_mask": torch.from_numpy(sky_mask),   # [V,H,W], bool
+
+        # encoder/input branch
+        "input_image_paths": input_image_paths,
+        "input_indices": input_indices,
+        "supervision_indices": supervision_indices,
+        "input_intrinsics": intrinsics,
+        "input_extrinsics": extrinsics,
+        "input_camera_xyz": camera_xyz,
+
+        # supervision branch
+        "images": supervision_images,
+        "intrinsics": supervision_intrinsics,
+        "extrinsics": supervision_extrinsics,
+        "camera_xyz": supervision_camera_xyz,
+        "sky_mask": torch.from_numpy(supervision_sky_mask),
     }
 
 @torch.no_grad()
@@ -1048,21 +1339,21 @@ def verify_scene_no_cache(
     os.makedirs(scene_dir, exist_ok=True)
 
     # print gt_rgb, rendered_rgbs
-    print(f"[VERIFY] gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}, "
-          f"min={gt_rgb.min().item():.4f}, max={gt_rgb.max().item():.4f}")
-    print(f"[VERIFY] rendered_rgbs: shape={rendered_rgbs.shape}, dtype={rendered_rgbs.dtype}, device={rendered_rgbs.device}, "
-          f"min={rendered_rgbs.min().item():.4f}, max={rendered_rgbs.max().item():.4f}")
-    print(f"[VERIFY] sky_mask: shape={sky_mask.shape}, dtype={sky_mask.dtype}, device={sky_mask.device}, "
-          f"num_sky_pixels={sky_mask.sum().item()}, num_valid_pixels={valid_mask.sum().item()}")
+    # print(f"[VERIFY] gt_rgb: shape={gt_rgb.shape}, dtype={gt_rgb.dtype}, device={gt_rgb.device}, "
+    #       f"min={gt_rgb.min().item():.4f}, max={gt_rgb.max().item():.4f}")
+    # print(f"[VERIFY] rendered_rgbs: shape={rendered_rgbs.shape}, dtype={rendered_rgbs.dtype}, device={rendered_rgbs.device}, "
+    #       f"min={rendered_rgbs.min().item():.4f}, max={rendered_rgbs.max().item():.4f}")
+    # print(f"[VERIFY] sky_mask: shape={sky_mask.shape}, dtype={sky_mask.dtype}, device={sky_mask.device}, "
+    #       f"num_sky_pixels={sky_mask.sum().item()}, num_valid_pixels={valid_mask.sum().item()}")
 
     for i, view_idx in enumerate(valid_view_indices):
         save_tensor_image(gt_rgb[i], f"{scene_dir}/view_{view_idx}_gt.png")
         save_tensor_image(rendered_rgbs[i], f"{scene_dir}/view_{view_idx}_pred.png")
         save_diff_image(rendered_rgbs[i], gt_rgb[i], f"{scene_dir}/view_{view_idx}_diff.png")
 
-    save_gaussian_scene_npz(
+    save_flat_scene_as_ply(
         flat_scene,
-        os.path.join(scene_dir, "gaussian_scene.npz")
+        os.path.join(scene_dir, "gaussian_scene.ply"),
     )
 
     print(f"[VERIFY] {scene_name} L1 = {l1:.6f}")
@@ -1135,6 +1426,37 @@ def main():
     parser.add_argument("--val-view-indices", nargs="*", type=int, default=[0, 10, 20])
     parser.add_argument("--verify-render-chunk-size", type=int, default=2)
 
+    parser.add_argument("--sequence-length", type=int, default=12)
+    parser.add_argument("--sequence-stride", type=int, default=1)
+    parser.add_argument(
+        "--supervision-mode",
+        type=str,
+        default="even_input_mixed_supervision",
+        choices=[
+            "random_views",
+            "even_input_mixed_supervision",
+        ],
+    )
+
+    parser.add_argument(
+        "--scene-list-file",
+        type=str,
+        default=None,
+        help="Path to a txt file containing one scene name per line",
+    )
+    parser.add_argument(
+        "--scene-filter-mode",
+        type=str,
+        default="restrict",
+        choices=["restrict", "exclude"],
+        help="How to apply --scene-list-file to discovered scenes",
+    )
+    parser.add_argument(
+        "--train-only-scene-list",
+        action="store_true",
+        help="If set, apply scene-list filtering only to training scenes, not validation scenes",
+    )
+
     # voxelizer params
     parser.add_argument("--voxel-size", type=float, default=0.4)
     parser.add_argument("--max-depth", type=float, default=50.0)
@@ -1192,22 +1514,56 @@ def main():
         if args.wandb_watch_model:
             wandb.watch(decoder if "decoder" in locals() else None, log="all", log_freq=100)
 
-    scenes = discover_waymo_scenes(
+        scenes = discover_waymo_scenes(
         dataset_root=args.dataset_root,
         camera_name=args.camera_name,
     )
-    print(f"[INFO] Found {len(scenes)} scenes")
+    print(f"[INFO] Found {len(scenes)} scenes before filtering")
 
-    all_scene_names = [s["scene_name"] for s in scenes]
+    scene_list_names = []
+    if args.scene_list_file is not None:
+        scene_list_names = load_scene_name_list(args.scene_list_file)
+        print(f"[INFO] Loaded {len(scene_list_names)} scene names from {args.scene_list_file}")
 
+    # split first
     if len(args.val_scene_names) > 0:
         val_scene_names = set(args.val_scene_names)
         val_scenes = [s for s in scenes if s["scene_name"] in val_scene_names]
         train_scenes = [s for s in scenes if s["scene_name"] not in val_scene_names]
     else:
-        # 預設最後幾個 scene 當 val
         val_scenes = scenes[-args.val_max_scenes:]
         train_scenes = scenes[:-args.val_max_scenes] if len(scenes) > args.val_max_scenes else scenes
+
+    # then filter by scene list
+    if len(scene_list_names) > 0:
+        if args.train_only_scene_list:
+            train_scenes = filter_scenes_by_name(
+                train_scenes,
+                scene_list_names,
+                mode=args.scene_filter_mode,
+            )
+        else:
+            train_scenes = filter_scenes_by_name(
+                train_scenes,
+                scene_list_names,
+                mode=args.scene_filter_mode,
+            )
+            val_scenes = filter_scenes_by_name(
+                val_scenes,
+                scene_list_names,
+                mode=args.scene_filter_mode,
+            )
+
+    print(f"[INFO] Final train scenes: {len(train_scenes)}")
+    print(f"[INFO] Final val scenes: {len(val_scenes)}")
+
+    if len(train_scenes) == 0:
+        raise RuntimeError("No training scenes left after filtering.")
+
+    if len(val_scenes) == 0:
+        print("[WARN] No validation scenes left after filtering.")
+
+    report_missing_scene_names(scenes, scene_list_names)
     # scenes = scenes[:1]
     # val_scenes = scenes[:1]
 
@@ -1272,43 +1628,33 @@ def main():
     global_step = 0
     for epoch in range(start_epoch, args.epochs + 1):
         last_train_log = None
+        epoch_logs = []
         print(f"\n[INFO] Epoch {epoch:04d}/{args.epochs}")
         np.random.shuffle(scene_groups)
 
         for group_idx, group in enumerate(scene_groups):
-            # continue
             print(f"[INFO] Loading group {group_idx+1}/{len(scene_groups)} with {len(group)} scenes")
-
-            group_cache = {}
-            for scene in group:
-                scene_name = scene["scene_name"]
-                # scene_out_dir = os.path.join(args.output_dir, "cache", scene_name)
-                scene_out_dir = os.path.join(args.cache_root, scene_name)
-                try:
-                    group_cache[scene_name] = prepare_scene_cache(
-                        model=model,
-                        voxelizer=voxelizer,
-                        image_paths=scene["image_paths"],
-                        output_dir=scene_out_dir,
-                        device=device,
-                    )
-                except Exception as e:
-                    print(f"[WARN] Skip scene {scene_name}: {e}")
-
-            if len(group_cache) == 0:
-                print("[WARN] No valid scenes in this group.")
-                continue
 
             logs = train_one_group(
                 decoder=decoder,
                 optimizer=optimizer,
-                group_scene_caches=group_cache,
-                steps_per_group=args.steps_per_group,
+                group_scenes=group,
+                model=model,
+                voxelizer=voxelizer,
+                cache_root=args.cache_root,
                 views_per_step=args.views_per_step,
+                steps_per_group=args.steps_per_group,
                 device=device,
+                sequence_length=args.sequence_length,
+                supervision_mode=args.supervision_mode,
             )
+
+            if len(logs) == 0:
+                print("[WARN] No valid logs in this group.")
+                continue
             if len(logs) > 0:
                 last_train_log = logs[-1]
+                epoch_logs.extend(logs)
 
             avg_total = np.mean([x["total"] for x in logs])
             print(f"[INFO] Group {group_idx+1} avg_total={avg_total:.6f}")
@@ -1322,6 +1668,10 @@ def main():
                         "train/global_step": global_step,
                         "train/loss_total": log_item["total"],
                     }
+
+                    delta_color_stats = log_item.get("delta_color_stats", None)
+                    if delta_color_stats is not None:
+                        wandb_log["train/delta_color_abs_mean"] = delta_color_stats["abs_mean"]
 
                     # save all loss in log_item that are not None
                     for k, v in log_item["losses"].items():
@@ -1343,6 +1693,10 @@ def main():
                     wandb_log.update({
                         f"train/memory/{k}": v for k, v in get_gpu_mem_stats(device).items()
                     })
+                    sampling_stats = log_item.get("sampling_stats", None)
+                    if sampling_stats is not None:
+                        wandb_log["train/num_seen_supervision"] = sampling_stats["num_seen"]
+                        wandb_log["train/num_novel_supervision"] = sampling_stats["num_novel"]
 
                     if global_step % args.wandb_log_train_images_every == 0:
                         # print log_item["rendered_rgb"].shape, log_item["gt_rgb"].shape
@@ -1363,7 +1717,6 @@ def main():
 
                     wandb.log(wandb_log, step=global_step)
 
-            del group_cache
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -1375,15 +1728,14 @@ def main():
                 output_dir=args.output_dir,
                 keep_last_k=args.keep_last_k,
             )
-            if (
-                last_train_log is not None
-                and last_train_log.get("flat_scene_to_save", None) is not None
-            ):
+            ply_candidates = [l for l in epoch_logs if l.get("flat_scene_to_save") is not None]
+            if ply_candidates:
+                worst_log = max(ply_candidates, key=lambda l: l["total"])
                 save_recent_training_ply(
-                    flat_scene=last_train_log["flat_scene_to_save"],
+                    flat_scene=worst_log["flat_scene_to_save"],
                     output_dir=args.output_dir,
                     epoch=epoch,
-                    scene_name=last_train_log["scene_name"],
+                    scene_name=worst_log["scene_name"],
                     keep_last_k=10,
                 )
         
@@ -1422,9 +1774,9 @@ def main():
 
                     if args.wandb_log_val_images:
                         # print pred0, gt0, mask0
-                        print(f"[DEBUG] val_info['pred_rgb'] shape={val_info['pred_rgb'].shape}, dtype={val_info['pred_rgb'].dtype}, device={val_info['pred_rgb'].device}")
-                        print(f"[DEBUG] val_info['gt_rgb'] shape={val_info['gt_rgb'].shape}, dtype={val_info['gt_rgb'].dtype}, device={val_info['gt_rgb'].device}")
-                        print(f"[DEBUG] val_info['sky_mask'] shape={val_info['sky_mask'].shape}, dtype={val_info['sky_mask'].dtype}, device={val_info['sky_mask'].device}")
+                        # print(f"[DEBUG] val_info['pred_rgb'] shape={val_info['pred_rgb'].shape}, dtype={val_info['pred_rgb'].dtype}, device={val_info['pred_rgb'].device}")
+                        # print(f"[DEBUG] val_info['gt_rgb'] shape={val_info['gt_rgb'].shape}, dtype={val_info['gt_rgb'].dtype}, device={val_info['gt_rgb'].device}")
+                        # print(f"[DEBUG] val_info['sky_mask'] shape={val_info['sky_mask'].shape}, dtype={val_info['sky_mask'].dtype}, device={val_info['sky_mask'].device}")
 
                         pred0 = val_info["pred_rgb"][0]
                         gt0 = val_info["gt_rgb"][0]

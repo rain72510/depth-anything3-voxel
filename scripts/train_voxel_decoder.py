@@ -1769,7 +1769,7 @@ def main():
                                 output_dir=args.output_dir,
                                 global_step=global_step,
                                 scene_name=log_item["scene_name"],
-                                keep_last_k=20,
+                                keep_last_k=10,
                             )
 
                     wandb.log(wandb_log, step=global_step)
@@ -1785,16 +1785,6 @@ def main():
                 output_dir=args.output_dir,
                 keep_last_k=args.keep_last_k,
             )
-            ply_candidates = [l for l in epoch_logs if l.get("flat_scene_to_save") is not None]
-            if ply_candidates:
-                worst_log = max(ply_candidates, key=lambda l: l["total"])
-                save_recent_training_ply(
-                    flat_scene=worst_log["flat_scene_to_save"],
-                    output_dir=args.output_dir,
-                    epoch=epoch,
-                    scene_name=worst_log["scene_name"],
-                    keep_last_k=10,
-                )
         
         if epoch % args.val_every == 0:
             val_l1_list = []

@@ -11,7 +11,7 @@ class SparseVoxelizer:
         truncation_band: float = 0.5,
         feat_mode: str = "last2_avg",      # "last", "last2_avg", "all4_avg"
         patch_size: int = 14,
-        feat_dim_out: Optional[int] = None # e.g. 256; None means keep original dim,
+        feat_dim_out: Optional[int] = None, # e.g. 256; None means keep original dim
         neighbor_patch_radius: int = 0,     # 0=center only, 1=3x3, 2=5x5 patch neighborhood
     ):
         self.max_depth = max_depth
@@ -274,19 +274,20 @@ class SparseVoxelizer:
                 point_feat_chunk = feat_tokens[view_ids_chunk, token_idx].to(torch.float32)
             else:
                 r = self.neighbor_patch_radius
-                neighbor_feats = []
+                n_neighbors = (2 * r + 1) ** 2
+                point_feat_chunk = torch.zeros(len(view_ids_chunk), C_small, device=device, dtype=torch.float32)
                 for dy in range(-r, r + 1):
                     for dx in range(-r, r + 1):
                         ny = (patch_y + dy).clamp(0, Hf - 1)
                         nx = (patch_x + dx).clamp(0, Wf - 1)
                         tidx = ny * Wf + nx
-                        neighbor_feats.append(feat_tokens[view_ids_chunk, tidx].to(torch.float32))
-                point_feat_chunk = torch.stack(neighbor_feats, dim=0).mean(dim=0)
+                        point_feat_chunk += feat_tokens[view_ids_chunk, tidx].to(torch.float32)
+                point_feat_chunk /= n_neighbors
 
             voxel_feature_sum.index_add_(0, inv_chunk, point_feat_chunk)
 
             # 可選，幫助釋放暫時 tensor
-            del view_ids_chunk, ys_chunk, xs_chunk, inv_chunk, token_idx, point_feat_chunk
+            del view_ids_chunk, ys_chunk, xs_chunk, inv_chunk, point_feat_chunk
 
         # print voxel_feature_sum min, max, mean
         # in func _aggregate_voxel_features_from_tokens_chunked, after the for loop

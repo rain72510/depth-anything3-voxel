@@ -13,6 +13,7 @@ class SparseVoxelizer:
         patch_size: int = 14,
         feat_dim_out: Optional[int] = None, # e.g. 256; None means keep original dim
         neighbor_patch_radius: int = 0,     # 0=center only, 1=3x3, 2=5x5 patch neighborhood
+        perview_conf: bool = False,         # if True, compute conf threshold per view instead of globally
     ):
         self.max_depth = max_depth
         self.voxel_size = voxel_size
@@ -23,6 +24,7 @@ class SparseVoxelizer:
         self.patch_size = patch_size
         self.feat_dim_out = feat_dim_out
         self.neighbor_patch_radius = neighbor_patch_radius
+        self.perview_conf = perview_conf
 
     @torch.no_grad()
     def voxelize_prediction(self, prediction: Any) -> Dict[str, Any]:
@@ -43,9 +45,19 @@ class SparseVoxelizer:
         # 2. 計算 Mask
         mask = torch.isfinite(depth) & (depth > 0) & (depth < self.max_depth)
         if conf is not None:
-            conf_thresh = torch.nanquantile(conf, self.conf_percentile / 100.0)
             mask &= torch.isfinite(conf)
-            mask &= (conf >= conf_thresh)
+            if self.perview_conf:
+                # per-view threshold: each camera gets its own percentile cutoff
+                for v in range(conf.shape[0]):
+                    view_conf = conf[v]
+                    valid = torch.isfinite(view_conf)
+                    if valid.any():
+                        thresh = torch.nanquantile(view_conf[valid], self.conf_percentile / 100.0)
+                        mask[v] &= (view_conf >= thresh)
+            else:
+                # global threshold across all views
+                conf_thresh = torch.nanquantile(conf, self.conf_percentile / 100.0)
+                mask &= (conf >= conf_thresh)
 
         # 3. 反投影
         world_points, view_ids, ys, xs = self._unproject_vectorized(depth, intrinsics, extrinsics, mask)

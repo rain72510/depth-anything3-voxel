@@ -1509,6 +1509,8 @@ def main():
     parser.add_argument("--feat-dim-out", type=int, default=128)
     parser.add_argument("--neighbor-patch-radius", type=int, default=0,
                         help="Neighboring patch radius for voxel feature aggregation (0=center only, 1=3x3, 2=5x5)")
+    parser.add_argument("--perview-conf", action="store_true",
+                        help="Compute confidence threshold per view instead of globally")
 
     # sky mask
     parser.add_argument(
@@ -1624,6 +1626,7 @@ def main():
         truncation_band=args.truncation_band,
         feat_mode=args.feat_mode,
         neighbor_patch_radius=args.neighbor_patch_radius,
+        perview_conf=args.perview_conf,
         # feat_dim_out=args.feat_dim_out,
     )
 

@@ -469,6 +469,48 @@ def save_flat_scene_as_ply(
         match_3dgs_mcmc_dev=False,
     )
 
+def save_debug_ply_pair(
+    flat_scene: dict,
+    voxel_mean_points,  # [K, 3] tensor or None
+    output_dir: str,
+    global_step: int,
+    scene_name: str,
+    keep_last_k: int = 20,
+):
+    """Save Gaussian PLY + voxel XYZ PLY for a logged render_samples step."""
+    import glob as _glob
+    debug_dir = os.path.join(output_dir, "debug_ply")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    prefix = f"step_{global_step:07d}_{scene_name}"
+
+    # 3DGS PLY
+    gs_path = os.path.join(debug_dir, prefix + "_gaussians.ply")
+    save_flat_scene_as_ply(flat_scene, gs_path)
+
+    # Voxel XYZ PLY
+    if voxel_mean_points is not None:
+        from plyfile import PlyData, PlyElement
+        import numpy as np
+        pts = voxel_mean_points.float().numpy()
+        el = PlyElement.describe(
+            np.array([(pts[i, 0], pts[i, 1], pts[i, 2]) for i in range(len(pts))],
+                     dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")]),
+            "vertex",
+        )
+        vox_path = os.path.join(debug_dir, prefix + "_voxels.ply")
+        PlyData([el]).write(vox_path)
+
+    # Keep only last K pairs
+    all_gs = sorted(_glob.glob(os.path.join(debug_dir, "step_*_gaussians.ply")), key=os.path.getmtime)
+    if len(all_gs) > keep_last_k:
+        for old_path in all_gs[:-keep_last_k]:
+            os.remove(old_path)
+            vox_old = old_path.replace("_gaussians.ply", "_voxels.ply")
+            if os.path.exists(vox_old):
+                os.remove(vox_old)
+
+
 def save_recent_training_ply(
     flat_scene: dict,
     output_dir: str,
@@ -896,6 +938,7 @@ def train_one_group(
             "view_indices": info["view_indices"],
             "scene_stats": info.get("scene_stats", {}),
             "flat_scene_to_save": info.get("flat_scene_to_save", None),
+            "voxel_mean_points": scene_cache["voxel_dict"]["voxel_mean_points"].detach().cpu() if scene_cache.get("voxel_dict") else None,
             "sky_mask": info.get("sky_mask", None),
             "delta_color_stats": info.get("delta_color_stats", None),
             "sampling_stats": info.get("sampling_stats", None),
@@ -1717,6 +1760,17 @@ def main():
                             caption=f"train step={global_step} scene={log_item['scene_name']}",
                         )
                         wandb_log["train/render_samples"] = imgs
+
+                        # save debug PLY pair for this render_samples step
+                        if log_item.get("flat_scene_to_save") is not None:
+                            save_debug_ply_pair(
+                                flat_scene=log_item["flat_scene_to_save"],
+                                voxel_mean_points=log_item.get("voxel_mean_points"),
+                                output_dir=args.output_dir,
+                                global_step=global_step,
+                                scene_name=log_item["scene_name"],
+                                keep_last_k=20,
+                            )
 
                     wandb.log(wandb_log, step=global_step)
 

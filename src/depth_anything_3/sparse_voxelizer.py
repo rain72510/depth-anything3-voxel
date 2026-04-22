@@ -11,7 +11,8 @@ class SparseVoxelizer:
         truncation_band: float = 0.5,
         feat_mode: str = "last2_avg",      # "last", "last2_avg", "all4_avg"
         patch_size: int = 14,
-        feat_dim_out: Optional[int] = None # e.g. 256; None means keep original dim
+        feat_dim_out: Optional[int] = None # e.g. 256; None means keep original dim,
+        neighbor_patch_radius: int = 0,     # 0=center only, 1=3x3, 2=5x5 patch neighborhood
     ):
         self.max_depth = max_depth
         self.voxel_size = voxel_size
@@ -21,6 +22,7 @@ class SparseVoxelizer:
         self.feat_mode = feat_mode
         self.patch_size = patch_size
         self.feat_dim_out = feat_dim_out
+        self.neighbor_patch_radius = neighbor_patch_radius
 
     @torch.no_grad()
     def voxelize_prediction(self, prediction: Any) -> Dict[str, Any]:
@@ -235,7 +237,7 @@ class SparseVoxelizer:
 
         assert Ntok == Hf * Wf, f"Ntok={Ntok}, expected {Hf * Wf} from image_hw={image_hw}, patch={patch}"
 
-        print(f"Before cut from 3072 to feat_dim_out={self.feat_dim_out}, feat_tokens shape: {feat_tokens.shape}")
+        # print(f"Before cut from 3072 to feat_dim_out={self.feat_dim_out}, feat_tokens shape: {feat_tokens.shape}")
 
         # 2. optional dim truncation (先切，再 gather)
         if self.feat_dim_out is not None and self.feat_dim_out < C:
@@ -265,10 +267,21 @@ class SparseVoxelizer:
 
             patch_y = ys_chunk // patch
             patch_x = xs_chunk // patch
-            token_idx = patch_y * Wf + patch_x   # [chunk]
 
-            # [chunk, C_small]
-            point_feat_chunk = feat_tokens[view_ids_chunk, token_idx].to(torch.float32)
+            # [chunk, C_small] — gather from center patch or NxN neighborhood
+            if self.neighbor_patch_radius == 0:
+                token_idx = patch_y * Wf + patch_x
+                point_feat_chunk = feat_tokens[view_ids_chunk, token_idx].to(torch.float32)
+            else:
+                r = self.neighbor_patch_radius
+                neighbor_feats = []
+                for dy in range(-r, r + 1):
+                    for dx in range(-r, r + 1):
+                        ny = (patch_y + dy).clamp(0, Hf - 1)
+                        nx = (patch_x + dx).clamp(0, Wf - 1)
+                        tidx = ny * Wf + nx
+                        neighbor_feats.append(feat_tokens[view_ids_chunk, tidx].to(torch.float32))
+                point_feat_chunk = torch.stack(neighbor_feats, dim=0).mean(dim=0)
 
             voxel_feature_sum.index_add_(0, inv_chunk, point_feat_chunk)
 
@@ -328,83 +341,3 @@ class SparseVoxelizer:
         bottom = torch.tensor([0, 0, 0, 1], device=E.device, dtype=E.dtype).view(1, 1, 4).expand(N, 1, 4)
         return torch.cat([E, bottom], dim=1)   # (N, 4, 4)
     
-
-
-import os
-import numpy as np
-
-def export_voxel_centers_npz_and_glb(
-    voxel_dict,
-    out_path_glb: str,
-    use_mean_points: bool = True,
-    save_npz: bool = True,
-    sphere_radius: float = None,
-):
-    """
-    voxel_dict: voxelize_prediction(...) 的輸出
-    use_mean_points:
-        True  -> 用 voxel_mean_points
-        False -> 用幾何 voxel center = (idx + 0.5) * voxel_size
-    sphere_radius:
-        None  -> 自動設成 voxel_size * 0.15
-    """
-
-    try:
-        import trimesh
-    except ImportError:
-        raise ImportError("Please install trimesh: pip install trimesh")
-
-    voxel_size = float(voxel_dict["voxel_size"])
-
-    if use_mean_points:
-        centers = voxel_dict["voxel_mean_points"]
-    else:
-        centers = (voxel_dict["voxel_indices"].float() + 0.5) * voxel_size
-
-    if torch.is_tensor(centers):
-        centers_np = centers.detach().cpu().numpy()
-    else:
-        centers_np = np.asarray(centers)
-
-    colors = voxel_dict.get("voxel_colors", None)
-    if colors is not None:
-        if torch.is_tensor(colors):
-            colors_np = colors.detach().cpu().numpy()
-        else:
-            colors_np = np.asarray(colors)
-
-        # 若顏色是 0~1，轉成 uint8
-        if colors_np.dtype != np.uint8:
-            colors_np = np.clip(colors_np, 0.0, 1.0)
-            colors_np = (colors_np * 255).astype(np.uint8)
-    else:
-        colors_np = np.tile(np.array([[255, 0, 0]], dtype=np.uint8), (centers_np.shape[0], 1))
-
-    # ===== 先存 npz =====
-    if save_npz:
-        npz_path = os.path.splitext(out_path_glb)[0] + ".npz"
-        np.savez_compressed(
-            npz_path,
-            centers=centers_np,
-            colors=colors_np,
-            voxel_size=voxel_size,
-        )
-        print(f"[INFO] Saved voxel centers npz to: {npz_path}")
-
-    # ===== 存 glb =====
-    # 最穩的是把每個 center 畫成小球；viewer 相容性通常比 point cloud 好
-    if sphere_radius is None:
-        sphere_radius = voxel_size * 0.15
-
-    scene = trimesh.Scene()
-
-    for i in range(centers_np.shape[0]):
-        sphere = trimesh.creation.icosphere(subdivisions=1, radius=sphere_radius)
-        sphere.visual.vertex_colors = np.tile(
-            np.append(colors_np[i], 255), (sphere.vertices.shape[0], 1)
-        )
-        sphere.apply_translation(centers_np[i])
-        scene.add_geometry(sphere)
-
-    scene.export(out_path_glb)
-    print(f"[INFO] Saved voxel centers glb to: {out_path_glb}")

@@ -1464,6 +1464,8 @@ def main():
     parser.add_argument("--truncation-band", type=float, default=0.5)
     parser.add_argument("--feat-mode", type=str, default="last2_avg")
     parser.add_argument("--feat-dim-out", type=int, default=128)
+    parser.add_argument("--neighbor-patch-radius", type=int, default=0,
+                        help="Neighboring patch radius for voxel feature aggregation (0=center only, 1=3x3, 2=5x5)")
 
     # sky mask
     parser.add_argument(
@@ -1578,6 +1580,7 @@ def main():
         conf_percentile=args.conf_percentile,
         truncation_band=args.truncation_band,
         feat_mode=args.feat_mode,
+        neighbor_patch_radius=args.neighbor_patch_radius,
         # feat_dim_out=args.feat_dim_out,
     )
 

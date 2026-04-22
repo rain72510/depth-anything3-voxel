@@ -1514,9 +1514,9 @@ def main():
         if args.wandb_watch_model:
             wandb.watch(decoder if "decoder" in locals() else None, log="all", log_freq=100)
 
-        scenes = discover_waymo_scenes(
-        dataset_root=args.dataset_root,
-        camera_name=args.camera_name,
+    scenes = discover_waymo_scenes(
+    dataset_root=args.dataset_root,
+    camera_name=args.camera_name,
     )
     print(f"[INFO] Found {len(scenes)} scenes before filtering")
 

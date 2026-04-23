@@ -24,6 +24,7 @@ from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
 
 from types import SimpleNamespace
 from PIL import Image
+import lpips
 
 from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj_mode, render_3dgs
 from depth_anything_3.specs import Gaussians
@@ -31,6 +32,7 @@ from depth_anything_3.utils.gsply_helpers import export_ply
 from depth_anything_3.utils.loss_utils import ssim
 
 from PIL import Image
+import lpips
 import math
 
 def tensor_to_uint8_image(x: torch.Tensor) -> np.ndarray:
@@ -305,6 +307,8 @@ def compute_photometric_loss(
     # lambda_dssim: float = 0.02,
     lambda_dssim: float = 0,
     lambda_scale_vol: float = 1e-2,
+    lambda_lpips: float = 0.05,
+    lpips_fn=None,
 ) -> Dict[str, torch.Tensor]:
     losses = {}
 
@@ -377,6 +381,20 @@ def compute_photometric_loss(
     # for k, v in losses.items():
     #     print(f"{k} loss: {v.item():.6f}")
 
+    # LPIPS loss (same sky mask applied)
+    if lpips_fn is not None and lambda_lpips > 0:
+        if valid_mask is not None:
+            mask4 = valid_mask.unsqueeze(1).float()  # [v,1,H,W]
+            r_masked = rendered_rgb * mask4
+            g_masked = gt_rgb * mask4
+        else:
+            r_masked = rendered_rgb
+            g_masked = gt_rgb
+        lpips_val = lpips_fn(r_masked * 2 - 1, g_masked * 2 - 1).mean()
+        losses["lpips"] = lambda_lpips * lpips_val
+    else:
+        losses["lpips"] = torch.tensor(0.0, device=rendered_rgb.device)
+
     losses["total"] = (
         losses["photo"]
         + losses["color"]
@@ -387,6 +405,7 @@ def compute_photometric_loss(
         # + losses["anchor_scale_reg"]
         # + losses["disp_reg"]
         + losses["dssim"]
+        + losses["lpips"]
 
     )
     return losses
@@ -643,6 +662,7 @@ def train_one_step_on_scene(
     device: torch.device,
     views_per_step: int = 2,
     render_chunk_size: int = 2,
+    lpips_fn=None,
 ):
     decoder.train()
     optimizer.zero_grad()
@@ -722,6 +742,7 @@ def train_one_step_on_scene(
 
     total_loss = 0.0
     loss_photo_sum = 0.0
+    loss_lpips_sum = 0.0
     loss_offset_reg_sum = 0.0
     loss_scale_reg_sum = 0.0
     loss_opacity_reg_sum = 0.0
@@ -776,6 +797,7 @@ def train_one_step_on_scene(
             rendered_rgb=rendered_rgb,
             gt_rgb=gt_rgb,
             valid_mask=valid_mask,
+            lpips_fn=lpips_fn,
         )
         # print(f"Compute photometric loss done. Time: {time.time() - start:.2f} seconds.")
 
@@ -835,6 +857,7 @@ def train_one_step_on_scene(
             "opacity_reg": loss_opacity_reg_sum / num_views,
             "color": loss_color_sum / num_views,
             "scale_vol_reg": loss_scale_vol_reg_sum / num_views,
+            "lpips": loss_lpips_sum / num_views,
         },
         "rendered_rgb": rendered_rgbs_to_log[0],
         "gt_rgb": gt_rgbs_to_log[0],
@@ -870,6 +893,7 @@ def train_one_group(
     device,
     sequence_length,
     supervision_mode,
+    lpips_fn=None,
 ):
     scene_names = [s["scene_name"] for s in group_scenes]
     scene_map = {s["scene_name"]: s for s in group_scenes}
@@ -927,6 +951,7 @@ def train_one_group(
             scene_cache=scene_cache,
             views_per_step=views_per_step,
             device=device,
+            lpips_fn=lpips_fn,
         )
 
         step_logs.append({
@@ -1654,6 +1679,11 @@ def main():
 
     optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
 
+    lpips_fn = lpips.LPIPS(net="vgg").to(device)
+    lpips_fn.eval()
+    for p in lpips_fn.parameters():
+        p.requires_grad_(False)
+
     start_epoch = 1
 
     if args.resume is not None:
@@ -1696,6 +1726,7 @@ def main():
                 device=device,
                 sequence_length=args.sequence_length,
                 supervision_mode=args.supervision_mode,
+                lpips_fn=lpips_fn,
             )
 
             if len(logs) == 0:

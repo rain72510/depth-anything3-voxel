@@ -323,7 +323,7 @@ class VoxelGaussianDecoder(nn.Module):
         
         # scale_raw = self.scale_head(h).view(N, K, 3)               # [N, K, 3]
         # scales = gaussian_base_scale[:, None, :] * torch.sigmoid(scale_raw) + 1e-4
-        scales = torch.sigmoid(scale_raw) * self.voxel_size * 0.5
+        scales = (torch.exp(scale_raw) * (self.voxel_size * 0.1) + 1e-4).clamp(max=self.voxel_size * 0.5)
         # scales = torch.full_like(scales, self.voxel_size * 0.5)
 
         quaternions = normalize_quaternion(quat_raw)
@@ -384,4 +384,5 @@ class VoxelGaussianDecoder(nn.Module):
             "anchor_latent": h,             # [N, H]
             "offset_scale": offset_scale,       # [N, 3]
             "delta_color": delta_color if self.use_voxel_color else None,
+            "base_color": base_color if self.use_voxel_color else None,
         }

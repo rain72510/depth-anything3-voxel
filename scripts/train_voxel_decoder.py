@@ -1679,7 +1679,7 @@ def main():
 
     optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
 
-    lpips_fn = lpips.LPIPS(net="vgg").to(device)
+    lpips_fn = lpips.LPIPS(net="alex").to(device)
     lpips_fn.eval()
     for p in lpips_fn.parameters():
         p.requires_grad_(False)

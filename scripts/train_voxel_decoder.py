@@ -390,7 +390,7 @@ def compute_photometric_loss(
         else:
             r_masked = rendered_rgb
             g_masked = gt_rgb
-        lpips_val = lpips_fn(r_masked * 2 - 1, g_masked * 2 - 1).mean()
+        lpips_val = lpips_fn(r_masked.cpu() * 2 - 1, g_masked.cpu() * 2 - 1).mean().to(rendered_rgb.device)
         losses["lpips"] = lambda_lpips * lpips_val
     else:
         losses["lpips"] = torch.tensor(0.0, device=rendered_rgb.device)
@@ -1679,7 +1679,7 @@ def main():
 
     optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
 
-    lpips_fn = lpips.LPIPS(net="alex").to(device)
+    lpips_fn = lpips.LPIPS(net="alex").cpu()
     lpips_fn.eval()
     for p in lpips_fn.parameters():
         p.requires_grad_(False)

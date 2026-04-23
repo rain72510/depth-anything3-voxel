@@ -1807,10 +1807,10 @@ def main():
                 if verify_out["ok"]:
                     val_info = verify_out["result"]
                     # 正常 log / save
+                    val_l1_list.append(val_info["l1"])
                 else:
                     print(f"[WARN] skip this verification because of error: {verify_out['error']}")
-
-                val_l1_list.append(val_info["l1"])
+                    continue
 
                 if args.use_wandb:
                     val_log = {

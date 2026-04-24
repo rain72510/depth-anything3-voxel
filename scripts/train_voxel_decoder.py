@@ -35,6 +35,11 @@ from PIL import Image
 import lpips
 import math
 
+
+# ========================================================================
+# Utilities & I/O helpers
+# ========================================================================
+
 def tensor_to_uint8_image(x: torch.Tensor) -> np.ndarray:
     """
     x: [3,H,W], float in [0,1]
@@ -43,8 +48,10 @@ def tensor_to_uint8_image(x: torch.Tensor) -> np.ndarray:
     x = x.detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
     x = (x * 255.0).round().astype(np.uint8)
     return x
+
 def save_tensor_image(x: torch.Tensor, path: str):
     Image.fromarray(tensor_to_uint8_image(x)).save(path)
+
 def save_diff_image(pred: torch.Tensor, gt: torch.Tensor, path: str, amplify: float = 4.0):
     """
     pred, gt: [3,H,W], float in [0,1]
@@ -52,6 +59,7 @@ def save_diff_image(pred: torch.Tensor, gt: torch.Tensor, path: str, amplify: fl
     diff = (pred - gt).abs().mean(dim=0, keepdim=True)  # [1,H,W]
     diff = (diff * amplify).clamp(0, 1).repeat(3, 1, 1)
     save_tensor_image(diff, path)
+
 def select_valid_view_indices(num_views: int, requested: list[int]) -> list[int]:
     out = []
     for idx in requested:
@@ -61,19 +69,44 @@ def select_valid_view_indices(num_views: int, requested: list[int]) -> list[int]
         out = [0]
     return out
 
-
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     np.random.seed(seed)
-
 
 def save_json(obj, path):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
-
 def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
+
+def make_timestamped_output_dir(base_output_dir: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    final_dir = os.path.join(base_output_dir, timestamp)
+    os.makedirs(final_dir, exist_ok=True)
+    return final_dir
+
+def chunk_list(items, chunk_size):
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+def mask_to_uint8_image(mask: torch.Tensor) -> np.ndarray:
+    """
+    mask: [H,W] bool or float
+    return: [H,W,3] uint8
+    """
+    if mask.dtype == torch.bool:
+        x = mask.float()
+    else:
+        x = mask
+    x = x.detach().clamp(0, 1).cpu().numpy()
+    x = (x * 255).astype(np.uint8)
+    x = np.stack([x, x, x], axis=-1)
+    return x
+
+
+# ========================================================================
+# Memory diagnostics & W&B image helpers
+# ========================================================================
 
 def get_cpu_mem_stats():
     vm = psutil.virtual_memory()
@@ -113,37 +146,135 @@ def make_wandb_image_triplet(pred: torch.Tensor, gt: torch.Tensor, caption: str 
         wandb.Image(diff_np, caption=f"{caption} | diff"),
     ]
 
-def make_timestamped_output_dir(base_output_dir: str) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    final_dir = os.path.join(base_output_dir, timestamp)
-    os.makedirs(final_dir, exist_ok=True)
-    return final_dir
-
-def save_checkpoint(
-    decoder,
-    optimizer,
-    epoch,
-    output_dir,
-    keep_last_k=5,
+def make_wandb_image_triplet_with_mask(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+    caption: str = "",
 ):
-    ckpt_dir = os.path.join(output_dir, "checkpoints")
-    os.makedirs(ckpt_dir, exist_ok=True)
+    diff = (pred - gt).abs().mean(dim=0, keepdim=True).repeat(3, 1, 1).clamp(0, 1)
 
-    ckpt_path = os.path.join(ckpt_dir, f"ckpt_epoch_{epoch:04d}.pth")
+    # print shape, dtype, device, min, max of pred, gt, diff, mask for debugging
+    # print(f"pred: shape={pred.shape}, dtype={pred.dtype}, device={pred.device}, min={pred.min().item():.4f}, max={pred.max().item():.4f}")
+    # print(f"gt: shape={gt.shape}, dtype={gt.dtype}, device={gt.device}, min={gt.min().item():.4f}, max={gt.max().item():.4f}")
+    # print(f"diff: shape={diff.shape}, dtype={diff.dtype}, device={diff.device}, min={diff.min().item():.4f}, max={diff.max().item():.4f}")
+    # print(f"mask: shape={mask.shape}, dtype={mask.dtype}, device={mask.device}, min={mask.min().item():.4f}, max={mask.max().item():.4f}")
+    pred_np = tensor_to_uint8_image(pred)
+    gt_np = tensor_to_uint8_image(gt)
+    diff_np = tensor_to_uint8_image(diff)
+    mask_np = mask_to_uint8_image(mask)
 
-    torch.save({
-        "epoch": epoch,
-        "decoder": decoder.state_dict(),
-        "optimizer": optimizer.state_dict(),
-    }, ckpt_path)
+    return [
+        wandb.Image(gt_np, caption=f"{caption} | gt"),
+        wandb.Image(pred_np, caption=f"{caption} | pred"),
+        wandb.Image(diff_np, caption=f"{caption} | diff"),
+        wandb.Image(mask_np, caption=f"{caption} | sky_mask"),
+    ]
 
-    print(f"[INFO] Saved checkpoint: {ckpt_path}")
 
-    # 刪舊的
-    ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "ckpt_epoch_*.pth")))
-    if len(ckpts) > keep_last_k:
-        for old_ckpt in ckpts[:-keep_last_k]:
-            os.remove(old_ckpt)
+# ========================================================================
+# Sky mask loading
+# ========================================================================
+
+def build_sky_mask_from_gt(
+    images_u8: np.ndarray,   # [V,H,W,3], uint8
+    depth: np.ndarray,       # [V,H,W]
+    conf: np.ndarray,        # [V,H,W]
+):
+    V, H, W, _ = images_u8.shape
+
+    # 上方區域 prior
+    ys = np.arange(H)[None, :, None]
+    top_mask = ys < int(0.45 * H)
+    top_mask = np.broadcast_to(top_mask, (V, H, W))
+
+    # 顏色條件：偏亮、低飽和
+    img = images_u8.astype(np.float32) / 255.0
+    rgb_max = img.max(axis=-1)
+    rgb_min = img.min(axis=-1)
+    sat = rgb_max - rgb_min
+    bright_low_sat = (rgb_max > 0.6) & (sat < 0.18)
+
+    # 幾何條件：遠 depth 或低 conf
+    valid_depth = np.isfinite(depth) & (depth > 0)
+    if valid_depth.any():
+        depth_thr = np.percentile(depth[valid_depth], 90)
+    else:
+        depth_thr = np.inf
+    far_mask = depth >= depth_thr
+
+    valid_conf = np.isfinite(conf)
+    if valid_conf.any():
+        conf_thr = np.percentile(conf[valid_conf], 25)
+    else:
+        conf_thr = -np.inf
+    low_conf = conf <= conf_thr
+
+    sky_mask = top_mask & bright_low_sat & (far_mask | low_conf)
+    return sky_mask.astype(np.bool_)
+
+def load_precomputed_sky_mask(cache_dir: str, images_u8: np.ndarray) -> np.ndarray:
+    sky_mask_path = os.path.join(cache_dir, "sky_mask.npz")
+
+    if not os.path.exists(sky_mask_path):
+        raise FileNotFoundError(
+            f"Precomputed sky mask not found: {sky_mask_path}\n"
+            f"Please run precompute_sky_mask.py first."
+        )
+
+    data = np.load(sky_mask_path)
+    sky_mask = data["sky_mask"].astype(np.bool_)
+
+    expected_shape = images_u8.shape[:3]   # [V,H,W]
+    if tuple(sky_mask.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"Sky mask shape mismatch: got {sky_mask.shape}, expected {expected_shape}"
+        )
+
+    return sky_mask
+
+def load_precomputed_sky_mask_subset(
+    scene_cache_dir: str,
+    full_num_views: int,
+    selected_indices: list[int],
+):
+    sky_mask_path = os.path.join(scene_cache_dir, "sky_mask.npz")
+
+    if not os.path.exists(sky_mask_path):
+        raise FileNotFoundError(
+            f"Precomputed sky mask not found: {sky_mask_path}\n"
+            f"Please run precompute_sky_mask.py first."
+        )
+
+    data = np.load(sky_mask_path)
+    sky_mask = data["sky_mask"].astype(np.bool_)   # [V,H,W]
+
+    cached_num_views = sky_mask.shape[0]
+
+    if cached_num_views != full_num_views:
+        print(
+            f"[WARN] sky mask num_views mismatch in {scene_cache_dir}: "
+            f"cache={cached_num_views}, current_scene={full_num_views}"
+        )
+
+    if len(selected_indices) == 0:
+        raise ValueError("selected_indices is empty.")
+
+    max_idx = max(selected_indices)
+    min_idx = min(selected_indices)
+
+    if min_idx < 0 or max_idx >= cached_num_views:
+        raise ValueError(
+            f"Sky mask index out of range: min={min_idx}, max={max_idx}, "
+            f"cached_num_views={cached_num_views}"
+        )
+
+    return sky_mask[selected_indices]
+
+
+# ========================================================================
+# Scene discovery, filtering & sampling
+# ========================================================================
 
 def discover_waymo_scenes(
     dataset_root: str,
@@ -212,6 +343,82 @@ def discover_waymo_scenes(
 
     return scenes
 
+def load_scene_name_list(txt_path: str) -> list[str]:
+    if txt_path is None:
+        return []
+
+    if not os.path.exists(txt_path):
+        raise FileNotFoundError(f"scene list file not found: {txt_path}")
+
+    scene_names = []
+    with open(txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            name = line.strip()
+            if len(name) == 0:
+                continue
+            scene_names.append(name)
+
+    return scene_names
+
+def filter_scenes_by_name(
+    scenes: list[dict],
+    selected_scene_names: list[str],
+    mode: str = "restrict",
+) -> list[dict]:
+    selected_set = set(selected_scene_names)
+
+    if mode == "restrict":
+        filtered = [s for s in scenes if s["scene_name"] in selected_set]
+    elif mode == "exclude":
+        filtered = [s for s in scenes if s["scene_name"] not in selected_set]
+    else:
+        raise ValueError(f"Unsupported scene filter mode: {mode}")
+
+    return filtered
+
+def report_missing_scene_names(discovered_scenes: list[dict], requested_scene_names: list[str]):
+    discovered = {s["scene_name"] for s in discovered_scenes}
+    missing = sorted(set(requested_scene_names) - discovered)
+    if len(missing) > 0:
+        print(f"[WARN] {len(missing)} scene(s) from list file were not found in dataset:")
+        for name in missing:
+            print(f"  - {name}")
+
+def sample_even_odd_window(image_paths, sequence_length, stride=1):
+    num_imgs = len(image_paths)
+    if num_imgs < sequence_length:
+        start = 0
+        end = num_imgs
+    else:
+        max_start = num_imgs - sequence_length
+        start = np.random.randint(0, max_start + 1)
+        end = start + sequence_length
+
+    window_indices = list(range(start, end, stride))
+    input_indices = window_indices[::2]   # 偶數位置
+    target_indices = window_indices[1::2] # 奇數位置
+
+    if len(input_indices) == 0:
+        input_indices = [window_indices[0]]
+    if len(target_indices) == 0:
+        target_indices = [window_indices[-1]]
+
+    input_paths = [image_paths[i] for i in input_indices]
+    target_global_indices = target_indices  # 對原 scene 的 index
+
+    return {
+        "start": start,
+        "end": end,
+        "window_indices": window_indices,
+        "input_indices": input_indices,
+        "target_indices": target_global_indices,
+        "input_paths": input_paths,
+    }
+
+
+# ========================================================================
+# Decoder inputs & Gaussian data prep
+# ========================================================================
 
 def build_decoder_inputs(voxel_dict: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
     """
@@ -253,7 +460,6 @@ def build_decoder_inputs(voxel_dict: Dict[str, Any], device: torch.device) -> Di
         "voxel_colors": voxel_colors,
     }
 
-
 def flatten_gaussians(out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """
     Convert [N, K, ...] -> [N*K, ...]
@@ -269,16 +475,53 @@ def flatten_gaussians(out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         flat["gaussian_feature"] = out["gaussian_feature"].reshape(-1, out["gaussian_feature"].shape[-1])
     return flat
 
+def build_renderer_gaussians(flat_scene: Dict[str, torch.Tensor]):
+    """
+    flat_scene:
+        means3D   [M,3]
+        scales    [M,3]
+        rotations [M,4]
+        opacity   [M,1] or [M]
+        colors    [M,3]
+    """
 
-def save_gaussian_scene_npz(scene: Dict[str, torch.Tensor], path: str):
-    np.savez_compressed(
-        path,
-        means3D=scene["means3D"].detach().cpu().numpy(),
-        scales=scene["scales"].detach().cpu().numpy(),
-        rotations=scene["rotations"].detach().cpu().numpy(),
-        opacity=scene["opacity"].detach().cpu().numpy(),
-        colors=scene["colors"].detach().cpu().numpy(),
+    means = flat_scene["means3D"]
+    scales = flat_scene["scales"]
+    rotations = flat_scene["rotations"]
+    opacities = flat_scene["opacity"]
+    colors = flat_scene["colors"]
+
+    if opacities.ndim == 2 and opacities.shape[-1] == 1:
+        opacities = opacities.squeeze(-1)   # -> [M]
+
+    # M = means.shape[0]
+    # device = means.device
+    # dtype = means.dtype
+    
+    # harmonics: [1, M, 3, 9]
+    # use RGB as SH DC term only
+
+    # harmonics = torch.zeros((1, M, 3, 9), device=device, dtype=dtype)
+    # harmonics[0, :, :, 0] = colors
+
+    gaussian = SimpleNamespace(
+        means=means.unsqueeze(0),          # [1, M, 3]
+        scales=scales.unsqueeze(0),        # [1, M, 3]
+        rotations=rotations.unsqueeze(0),  # [1, M, 4]
+        opacities=opacities.unsqueeze(0),  # [1, M]
+        # harmonics=harmonics,               # [1, M, 3, 9]
+        harmonics=colors.unsqueeze(0),              # [1, M, 3]
     )
+
+    # for k, v in gaussian.__dict__.items():
+    #     print(f"gaussian.{k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, "
+    #           f"min={v.min().item():.4f}, max={v.max().item():.4f}")
+    return gaussian
+
+
+# ========================================================================
+# Loss functions
+# ========================================================================
 
 def masked_l1_loss(pred, gt, valid_mask, eps=1e-8):
     # pred, gt: [B,3,H,W]
@@ -419,48 +662,20 @@ def compute_photometric_loss(
     )
     return losses
 
-def build_renderer_gaussians(flat_scene: Dict[str, torch.Tensor]):
-    """
-    flat_scene:
-        means3D   [M,3]
-        scales    [M,3]
-        rotations [M,4]
-        opacity   [M,1] or [M]
-        colors    [M,3]
-    """
 
-    means = flat_scene["means3D"]
-    scales = flat_scene["scales"]
-    rotations = flat_scene["rotations"]
-    opacities = flat_scene["opacity"]
-    colors = flat_scene["colors"]
+# ========================================================================
+# Checkpointing & PLY export
+# ========================================================================
 
-    if opacities.ndim == 2 and opacities.shape[-1] == 1:
-        opacities = opacities.squeeze(-1)   # -> [M]
-
-    # M = means.shape[0]
-    # device = means.device
-    # dtype = means.dtype
-    
-    # harmonics: [1, M, 3, 9]
-    # use RGB as SH DC term only
-
-    # harmonics = torch.zeros((1, M, 3, 9), device=device, dtype=dtype)
-    # harmonics[0, :, :, 0] = colors
-
-    gaussian = SimpleNamespace(
-        means=means.unsqueeze(0),          # [1, M, 3]
-        scales=scales.unsqueeze(0),        # [1, M, 3]
-        rotations=rotations.unsqueeze(0),  # [1, M, 4]
-        opacities=opacities.unsqueeze(0),  # [1, M]
-        # harmonics=harmonics,               # [1, M, 3, 9]
-        harmonics=colors.unsqueeze(0),              # [1, M, 3]
+def save_gaussian_scene_npz(scene: Dict[str, torch.Tensor], path: str):
+    np.savez_compressed(
+        path,
+        means3D=scene["means3D"].detach().cpu().numpy(),
+        scales=scene["scales"].detach().cpu().numpy(),
+        rotations=scene["rotations"].detach().cpu().numpy(),
+        opacity=scene["opacity"].detach().cpu().numpy(),
+        colors=scene["colors"].detach().cpu().numpy(),
     )
-
-    # for k, v in gaussian.__dict__.items():
-    #     print(f"gaussian.{k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, "
-    #           f"min={v.min().item():.4f}, max={v.max().item():.4f}")
-    return gaussian
 
 def save_flat_scene_as_ply(
     flat_scene: dict,
@@ -538,7 +753,6 @@ def save_debug_ply_pair(
             if os.path.exists(vox_old):
                 os.remove(vox_old)
 
-
 def save_recent_training_ply(
     flat_scene: dict,
     output_dir: str,
@@ -563,6 +777,37 @@ def save_recent_training_ply(
         for old_path in all_ply[:-keep_last_k]:
             os.remove(old_path)
             print(f"[INFO] Removed old ply: {old_path}")
+
+def save_checkpoint(
+    decoder,
+    optimizer,
+    epoch,
+    output_dir,
+    keep_last_k=5,
+):
+    ckpt_dir = os.path.join(output_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_epoch_{epoch:04d}.pth")
+
+    torch.save({
+        "epoch": epoch,
+        "decoder": decoder.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }, ckpt_path)
+
+    print(f"[INFO] Saved checkpoint: {ckpt_path}")
+
+    # 刪舊的
+    ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "ckpt_epoch_*.pth")))
+    if len(ckpts) > keep_last_k:
+        for old_ckpt in ckpts[:-keep_last_k]:
+            os.remove(old_ckpt)
+
+
+# ========================================================================
+# Rendering
+# ========================================================================
 
 def render_views_from_decoder_output(
     decoder_out: Dict[str, torch.Tensor],
@@ -663,6 +908,155 @@ def render_views_from_decoder_output(
     # print(f"Extracted rendered_depth: shape={rendered_depth.shape}, dtype={rendered_depth.dtype}, device={rendered_depth.device}")
 
     return rendered_rgb, rendered_depth, flat_scene
+
+
+# ========================================================================
+# Scene cache preparation
+# ========================================================================
+
+def prepare_scene_cache(
+    model: DepthAnything3,
+    voxelizer: SparseVoxelizer,
+    input_image_paths,
+    output_dir: str,
+    device: torch.device,
+    supervision_image_paths=None,
+    scene_cache_dir=None,
+    full_scene_num_views=None,
+    input_indices=None,
+    supervision_indices=None,
+):
+    ensure_dir(output_dir)
+
+    # print(f"preparing scene: image_paths={image_paths}")
+
+    with torch.no_grad():
+        prediction = model.inference(
+            input_image_paths,
+            export_dir=output_dir,
+            export_format="none",
+        )
+
+    # start = time.time()
+    voxel_dict = voxelizer.voxelize_prediction(prediction)
+    # print(f"Voxelization done. Time: {time.time() - start:.2f} seconds. Num voxels: {voxel_dict['num_voxels']}")
+
+    if voxel_dict["num_voxels"] == 0:
+        raise RuntimeError("Voxelization returned zero voxels.")
+
+    decoder_inputs = build_decoder_inputs(voxel_dict, device=device)
+    images = prediction.processed_images
+
+    intrinsics = torch.from_numpy(prediction.intrinsics).float().to(device)  # [V,3,3]
+    extrinsics = torch.from_numpy(prediction.extrinsics).float().to(device)  # likely [V,4,4] or [V,3,4]
+    # extrract from extrinsics if possible, otherwise raise error
+    # print(f"extrinsics shape: {extrinsics.shape}")
+    if extrinsics.shape[-2:] == (4, 4):
+        camera_xyz = extrinsics[:, :3, 3]  # [V,3]
+    elif extrinsics.shape[-2:] == (3, 4):
+        camera_xyz = extrinsics[:, :3, 3]  # [V,3]
+    else:
+        raise ValueError(f"Unsupported extrinsics shape: {extrinsics.shape}")
+    
+    if supervision_image_paths is None:
+        supervision_prediction = prediction
+        supervision_images = supervision_prediction.processed_images
+        supervision_intrinsics = torch.from_numpy(supervision_prediction.intrinsics).float().to(device)
+        supervision_extrinsics = torch.from_numpy(supervision_prediction.extrinsics).float().to(device)
+        supervision_camera_xyz = supervision_extrinsics[:, :3, 3]
+
+        if scene_cache_dir is None:
+            raise ValueError("scene_cache_dir is required to load precomputed sky mask.")
+
+        if full_scene_num_views is None:
+            full_scene_num_views = len(input_image_paths)
+
+        if supervision_indices is None:
+            supervision_indices = list(range(len(supervision_images)))
+
+        try:
+            supervision_sky_mask = load_precomputed_sky_mask_subset(
+                scene_cache_dir=scene_cache_dir,
+                full_num_views=full_scene_num_views,
+                selected_indices=supervision_indices,
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to load sky mask subset for {scene_cache_dir}: {e}")
+            H, W = supervision_images.shape[1:3]
+            supervision_sky_mask = np.zeros(
+                (len(supervision_images), H, W),
+                dtype=np.bool_,
+            )
+    else:
+        with torch.no_grad():
+            supervision_prediction = model.inference(
+                supervision_image_paths,
+                export_format="none",
+            )
+
+        supervision_images = supervision_prediction.processed_images
+        supervision_intrinsics = torch.from_numpy(supervision_prediction.intrinsics).float().to(device)
+        supervision_extrinsics = torch.from_numpy(supervision_prediction.extrinsics).float().to(device)
+        supervision_camera_xyz = supervision_extrinsics[:, :3, 3]
+
+        if scene_cache_dir is None:
+            raise ValueError("scene_cache_dir is required to load precomputed sky mask.")
+        if full_scene_num_views is None:
+            raise ValueError("full_scene_num_views is required for supervision subset mode.")
+        if supervision_indices is None:
+            raise ValueError("supervision_indices is required for supervision subset mode.")
+
+        try:
+            supervision_sky_mask = load_precomputed_sky_mask_subset(
+                scene_cache_dir=scene_cache_dir,
+                full_num_views=full_scene_num_views,
+                selected_indices=supervision_indices,
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to load sky mask subset for {scene_cache_dir}: {e}")
+            H, W = supervision_images.shape[1:3]
+            supervision_sky_mask = np.zeros(
+                (len(supervision_images), H, W),
+                dtype=np.bool_,
+            )
+
+    # return {
+    #     "prediction": prediction,
+    #     "voxel_dict": voxel_dict,
+    #     "decoder_inputs": decoder_inputs,
+    #     "images": images,
+    #     "intrinsics": intrinsics,
+    #     "extrinsics": extrinsics,
+    #     "image_paths": image_paths,
+    #     "camera_xyz": camera_xyz,
+    #     "sky_mask": torch.from_numpy(sky_mask),   # [V,H,W], bool
+    # }
+
+    return {
+        "prediction": prediction,
+        "voxel_dict": voxel_dict,
+        "decoder_inputs": decoder_inputs,
+
+        # encoder/input branch
+        "input_image_paths": input_image_paths,
+        "input_indices": input_indices,
+        "supervision_indices": supervision_indices,
+        "input_intrinsics": intrinsics,
+        "input_extrinsics": extrinsics,
+        "input_camera_xyz": camera_xyz,
+
+        # supervision branch
+        "images": supervision_images,
+        "intrinsics": supervision_intrinsics,
+        "extrinsics": supervision_extrinsics,
+        "camera_xyz": supervision_camera_xyz,
+        "sky_mask": torch.from_numpy(supervision_sky_mask),
+    }
+
+
+# ========================================================================
+# Training loop
+# ========================================================================
 
 def train_one_step_on_scene(
     decoder: VoxelGaussianDecoder,
@@ -885,15 +1279,6 @@ def train_one_step_on_scene(
         },
     }
 
-    # return {
-    #     "losses": losses,
-    #     "flat_scene": flat_scene,
-    #     "rendered_rgb": rendered_rgbs.detach().cpu(),
-    #     "gt_rgb": gt_rgb.detach().cpu(),
-    #     "view_indices": view_indices.detach().cpu(),
-    #     "scene_stats": flat_scene_stats,
-    # }
-
 def train_one_group(
     decoder,
     optimizer,
@@ -985,354 +1370,10 @@ def train_one_group(
 
     return step_logs
 
-def chunk_list(items, chunk_size):
-    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
-def build_sky_mask_from_gt(
-    images_u8: np.ndarray,   # [V,H,W,3], uint8
-    depth: np.ndarray,       # [V,H,W]
-    conf: np.ndarray,        # [V,H,W]
-):
-    V, H, W, _ = images_u8.shape
-
-    # 上方區域 prior
-    ys = np.arange(H)[None, :, None]
-    top_mask = ys < int(0.45 * H)
-    top_mask = np.broadcast_to(top_mask, (V, H, W))
-
-    # 顏色條件：偏亮、低飽和
-    img = images_u8.astype(np.float32) / 255.0
-    rgb_max = img.max(axis=-1)
-    rgb_min = img.min(axis=-1)
-    sat = rgb_max - rgb_min
-    bright_low_sat = (rgb_max > 0.6) & (sat < 0.18)
-
-    # 幾何條件：遠 depth 或低 conf
-    valid_depth = np.isfinite(depth) & (depth > 0)
-    if valid_depth.any():
-        depth_thr = np.percentile(depth[valid_depth], 90)
-    else:
-        depth_thr = np.inf
-    far_mask = depth >= depth_thr
-
-    valid_conf = np.isfinite(conf)
-    if valid_conf.any():
-        conf_thr = np.percentile(conf[valid_conf], 25)
-    else:
-        conf_thr = -np.inf
-    low_conf = conf <= conf_thr
-
-    sky_mask = top_mask & bright_low_sat & (far_mask | low_conf)
-    return sky_mask.astype(np.bool_)
-
-def mask_to_uint8_image(mask: torch.Tensor) -> np.ndarray:
-    """
-    mask: [H,W] bool or float
-    return: [H,W,3] uint8
-    """
-    if mask.dtype == torch.bool:
-        x = mask.float()
-    else:
-        x = mask
-    x = x.detach().clamp(0, 1).cpu().numpy()
-    x = (x * 255).astype(np.uint8)
-    x = np.stack([x, x, x], axis=-1)
-    return x
-
-def make_wandb_image_triplet_with_mask(
-    pred: torch.Tensor,
-    gt: torch.Tensor,
-    mask: torch.Tensor,
-    caption: str = "",
-):
-    diff = (pred - gt).abs().mean(dim=0, keepdim=True).repeat(3, 1, 1).clamp(0, 1)
-
-    # print shape, dtype, device, min, max of pred, gt, diff, mask for debugging
-    # print(f"pred: shape={pred.shape}, dtype={pred.dtype}, device={pred.device}, min={pred.min().item():.4f}, max={pred.max().item():.4f}")
-    # print(f"gt: shape={gt.shape}, dtype={gt.dtype}, device={gt.device}, min={gt.min().item():.4f}, max={gt.max().item():.4f}")
-    # print(f"diff: shape={diff.shape}, dtype={diff.dtype}, device={diff.device}, min={diff.min().item():.4f}, max={diff.max().item():.4f}")
-    # print(f"mask: shape={mask.shape}, dtype={mask.dtype}, device={mask.device}, min={mask.min().item():.4f}, max={mask.max().item():.4f}")
-    pred_np = tensor_to_uint8_image(pred)
-    gt_np = tensor_to_uint8_image(gt)
-    diff_np = tensor_to_uint8_image(diff)
-    mask_np = mask_to_uint8_image(mask)
-
-    return [
-        wandb.Image(gt_np, caption=f"{caption} | gt"),
-        wandb.Image(pred_np, caption=f"{caption} | pred"),
-        wandb.Image(diff_np, caption=f"{caption} | diff"),
-        wandb.Image(mask_np, caption=f"{caption} | sky_mask"),
-    ]
-
-def load_precomputed_sky_mask(cache_dir: str, images_u8: np.ndarray) -> np.ndarray:
-    sky_mask_path = os.path.join(cache_dir, "sky_mask.npz")
-
-    if not os.path.exists(sky_mask_path):
-        raise FileNotFoundError(
-            f"Precomputed sky mask not found: {sky_mask_path}\n"
-            f"Please run precompute_sky_mask.py first."
-        )
-
-    data = np.load(sky_mask_path)
-    sky_mask = data["sky_mask"].astype(np.bool_)
-
-    expected_shape = images_u8.shape[:3]   # [V,H,W]
-    if tuple(sky_mask.shape) != tuple(expected_shape):
-        raise ValueError(
-            f"Sky mask shape mismatch: got {sky_mask.shape}, expected {expected_shape}"
-        )
-
-    return sky_mask
-
-def load_precomputed_sky_mask_subset(
-    scene_cache_dir: str,
-    full_num_views: int,
-    selected_indices: list[int],
-):
-    sky_mask_path = os.path.join(scene_cache_dir, "sky_mask.npz")
-
-    if not os.path.exists(sky_mask_path):
-        raise FileNotFoundError(
-            f"Precomputed sky mask not found: {sky_mask_path}\n"
-            f"Please run precompute_sky_mask.py first."
-        )
-
-    data = np.load(sky_mask_path)
-    sky_mask = data["sky_mask"].astype(np.bool_)   # [V,H,W]
-
-    cached_num_views = sky_mask.shape[0]
-
-    if cached_num_views != full_num_views:
-        print(
-            f"[WARN] sky mask num_views mismatch in {scene_cache_dir}: "
-            f"cache={cached_num_views}, current_scene={full_num_views}"
-        )
-
-    if len(selected_indices) == 0:
-        raise ValueError("selected_indices is empty.")
-
-    max_idx = max(selected_indices)
-    min_idx = min(selected_indices)
-
-    if min_idx < 0 or max_idx >= cached_num_views:
-        raise ValueError(
-            f"Sky mask index out of range: min={min_idx}, max={max_idx}, "
-            f"cached_num_views={cached_num_views}"
-        )
-
-    return sky_mask[selected_indices]
-
-def sample_even_odd_window(image_paths, sequence_length, stride=1):
-    num_imgs = len(image_paths)
-    if num_imgs < sequence_length:
-        start = 0
-        end = num_imgs
-    else:
-        max_start = num_imgs - sequence_length
-        start = np.random.randint(0, max_start + 1)
-        end = start + sequence_length
-
-    window_indices = list(range(start, end, stride))
-    input_indices = window_indices[::2]   # 偶數位置
-    target_indices = window_indices[1::2] # 奇數位置
-
-    if len(input_indices) == 0:
-        input_indices = [window_indices[0]]
-    if len(target_indices) == 0:
-        target_indices = [window_indices[-1]]
-
-    input_paths = [image_paths[i] for i in input_indices]
-    target_global_indices = target_indices  # 對原 scene 的 index
-
-    return {
-        "start": start,
-        "end": end,
-        "window_indices": window_indices,
-        "input_indices": input_indices,
-        "target_indices": target_global_indices,
-        "input_paths": input_paths,
-    }
-
-def load_scene_name_list(txt_path: str) -> list[str]:
-    if txt_path is None:
-        return []
-
-    if not os.path.exists(txt_path):
-        raise FileNotFoundError(f"scene list file not found: {txt_path}")
-
-    scene_names = []
-    with open(txt_path, "r", encoding="utf-8") as f:
-        for line in f:
-            name = line.strip()
-            if len(name) == 0:
-                continue
-            scene_names.append(name)
-
-    return scene_names
-
-
-def filter_scenes_by_name(
-    scenes: list[dict],
-    selected_scene_names: list[str],
-    mode: str = "restrict",
-) -> list[dict]:
-    selected_set = set(selected_scene_names)
-
-    if mode == "restrict":
-        filtered = [s for s in scenes if s["scene_name"] in selected_set]
-    elif mode == "exclude":
-        filtered = [s for s in scenes if s["scene_name"] not in selected_set]
-    else:
-        raise ValueError(f"Unsupported scene filter mode: {mode}")
-
-    return filtered
-
-def report_missing_scene_names(discovered_scenes: list[dict], requested_scene_names: list[str]):
-    discovered = {s["scene_name"] for s in discovered_scenes}
-    missing = sorted(set(requested_scene_names) - discovered)
-    if len(missing) > 0:
-        print(f"[WARN] {len(missing)} scene(s) from list file were not found in dataset:")
-        for name in missing:
-            print(f"  - {name}")
-
-def prepare_scene_cache(
-    model: DepthAnything3,
-    voxelizer: SparseVoxelizer,
-    input_image_paths,
-    output_dir: str,
-    device: torch.device,
-    supervision_image_paths=None,
-    scene_cache_dir=None,
-    full_scene_num_views=None,
-    input_indices=None,
-    supervision_indices=None,
-):
-    ensure_dir(output_dir)
-
-    # print(f"preparing scene: image_paths={image_paths}")
-
-    with torch.no_grad():
-        prediction = model.inference(
-            input_image_paths,
-            export_dir=output_dir,
-            export_format="none",
-        )
-
-    # start = time.time()
-    voxel_dict = voxelizer.voxelize_prediction(prediction)
-    # print(f"Voxelization done. Time: {time.time() - start:.2f} seconds. Num voxels: {voxel_dict['num_voxels']}")
-
-    if voxel_dict["num_voxels"] == 0:
-        raise RuntimeError("Voxelization returned zero voxels.")
-
-    decoder_inputs = build_decoder_inputs(voxel_dict, device=device)
-    images = prediction.processed_images
-
-    intrinsics = torch.from_numpy(prediction.intrinsics).float().to(device)  # [V,3,3]
-    extrinsics = torch.from_numpy(prediction.extrinsics).float().to(device)  # likely [V,4,4] or [V,3,4]
-    # extrract from extrinsics if possible, otherwise raise error
-    # print(f"extrinsics shape: {extrinsics.shape}")
-    if extrinsics.shape[-2:] == (4, 4):
-        camera_xyz = extrinsics[:, :3, 3]  # [V,3]
-    elif extrinsics.shape[-2:] == (3, 4):
-        camera_xyz = extrinsics[:, :3, 3]  # [V,3]
-    else:
-        raise ValueError(f"Unsupported extrinsics shape: {extrinsics.shape}")
-    
-    if supervision_image_paths is None:
-        supervision_prediction = prediction
-        supervision_images = supervision_prediction.processed_images
-        supervision_intrinsics = torch.from_numpy(supervision_prediction.intrinsics).float().to(device)
-        supervision_extrinsics = torch.from_numpy(supervision_prediction.extrinsics).float().to(device)
-        supervision_camera_xyz = supervision_extrinsics[:, :3, 3]
-
-        if scene_cache_dir is None:
-            raise ValueError("scene_cache_dir is required to load precomputed sky mask.")
-
-        if full_scene_num_views is None:
-            full_scene_num_views = len(input_image_paths)
-
-        if supervision_indices is None:
-            supervision_indices = list(range(len(supervision_images)))
-
-        try:
-            supervision_sky_mask = load_precomputed_sky_mask_subset(
-                scene_cache_dir=scene_cache_dir,
-                full_num_views=full_scene_num_views,
-                selected_indices=supervision_indices,
-            )
-        except Exception as e:
-            print(f"[WARN] Failed to load sky mask subset for {scene_cache_dir}: {e}")
-            H, W = supervision_images.shape[1:3]
-            supervision_sky_mask = np.zeros(
-                (len(supervision_images), H, W),
-                dtype=np.bool_,
-            )
-    else:
-        with torch.no_grad():
-            supervision_prediction = model.inference(
-                supervision_image_paths,
-                export_format="none",
-            )
-
-        supervision_images = supervision_prediction.processed_images
-        supervision_intrinsics = torch.from_numpy(supervision_prediction.intrinsics).float().to(device)
-        supervision_extrinsics = torch.from_numpy(supervision_prediction.extrinsics).float().to(device)
-        supervision_camera_xyz = supervision_extrinsics[:, :3, 3]
-
-        if scene_cache_dir is None:
-            raise ValueError("scene_cache_dir is required to load precomputed sky mask.")
-        if full_scene_num_views is None:
-            raise ValueError("full_scene_num_views is required for supervision subset mode.")
-        if supervision_indices is None:
-            raise ValueError("supervision_indices is required for supervision subset mode.")
-
-        try:
-            supervision_sky_mask = load_precomputed_sky_mask_subset(
-                scene_cache_dir=scene_cache_dir,
-                full_num_views=full_scene_num_views,
-                selected_indices=supervision_indices,
-            )
-        except Exception as e:
-            print(f"[WARN] Failed to load sky mask subset for {scene_cache_dir}: {e}")
-            H, W = supervision_images.shape[1:3]
-            supervision_sky_mask = np.zeros(
-                (len(supervision_images), H, W),
-                dtype=np.bool_,
-            )
-
-    # return {
-    #     "prediction": prediction,
-    #     "voxel_dict": voxel_dict,
-    #     "decoder_inputs": decoder_inputs,
-    #     "images": images,
-    #     "intrinsics": intrinsics,
-    #     "extrinsics": extrinsics,
-    #     "image_paths": image_paths,
-    #     "camera_xyz": camera_xyz,
-    #     "sky_mask": torch.from_numpy(sky_mask),   # [V,H,W], bool
-    # }
-
-    return {
-        "prediction": prediction,
-        "voxel_dict": voxel_dict,
-        "decoder_inputs": decoder_inputs,
-
-        # encoder/input branch
-        "input_image_paths": input_image_paths,
-        "input_indices": input_indices,
-        "supervision_indices": supervision_indices,
-        "input_intrinsics": intrinsics,
-        "input_extrinsics": extrinsics,
-        "input_camera_xyz": camera_xyz,
-
-        # supervision branch
-        "images": supervision_images,
-        "intrinsics": supervision_intrinsics,
-        "extrinsics": supervision_extrinsics,
-        "camera_xyz": supervision_camera_xyz,
-        "sky_mask": torch.from_numpy(supervision_sky_mask),
-    }
+# ========================================================================
+# Validation
+# ========================================================================
 
 @torch.no_grad()
 def verify_scene_no_cache(
@@ -1473,6 +1514,11 @@ def safe_verify_scene_no_cache(*args, **kwargs):
             "result": None,
             "error": repr(e),
         }
+
+
+# ========================================================================
+# Main entry
+# ========================================================================
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1903,6 +1949,11 @@ def main():
                     "val/epoch_mean_l1": float(np.mean(val_l1_list)),
                     "val/epoch": epoch,
                 }, step=global_step)
+
+
+# ========================================================================
+# Module entry point
+# ========================================================================
 
 if __name__ == "__main__":
     main()

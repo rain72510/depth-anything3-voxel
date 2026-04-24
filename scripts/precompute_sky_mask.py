@@ -1,10 +1,10 @@
 
 """
-python scripts/precompute_sky_mask.py
-  --dataset-root datasets/waymo
-  --camera-name FRONT
-  --cache-root output_train_voxel_decoder/cache
-  --device cuda
+python scripts/precompute_sky_mask.py \
+  --dataset-root datasets/waymo \
+  --camera-name FRONT \
+  --cache-root output_train_voxel_decoder/cache \
+  --device cuda \
   --save-preview
 
 """

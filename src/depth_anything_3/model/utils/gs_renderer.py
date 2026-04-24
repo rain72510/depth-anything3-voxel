@@ -73,10 +73,11 @@ def render_3dgs(
         degree = isqrt(n) - 1
         shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
     else:  # use color
-        shs = (
-            gaussian_sh_coefficients.squeeze(-1).sigmoid().contiguous()
-        )  # (b, g, c), normed to (0, 1)
-        shs = gaussian_sh_coefficients.contiguous().clamp(0.0, 1.0)
+        # shs = (
+        #     gaussian_sh_coefficients.squeeze(-1).sigmoid().contiguous()
+        # )  # (b, g, c), normed to (0, 1)
+        # shs = gaussian_sh_coefficients.contiguous().clamp(0.0, 1.0)
+        shs = gaussian_sh_coefficients.contiguous()
 
     h, w = image_shape
 

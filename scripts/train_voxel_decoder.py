@@ -21,6 +21,7 @@ from depth_anything_3.api import DepthAnything3
 # 你自己的 voxelizer 與 decoder
 from depth_anything_3.sparse_voxelizer import SparseVoxelizer
 from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
+from depth_anything_3.model.sky_mlp import SkyMLP, compute_ray_dirs_world
 
 from types import SimpleNamespace
 from PIL import Image
@@ -552,7 +553,10 @@ def compute_photometric_loss(
     lambda_scale_vol: float = 1e-2,
     lambda_lpips: float = 0.05,
     lambda_aniso: float = 0.05,
+    lambda_sky: float = 1.0,
     lpips_fn=None,
+    sky_rgb: torch.Tensor = None,         # [v,3,H,W] predicted sky, optional
+    sky_mask_bool: torch.Tensor = None,   # [v,H,W] True=sky, optional
 ) -> Dict[str, torch.Tensor]:
     losses = {}
 
@@ -632,6 +636,12 @@ def compute_photometric_loss(
     # for k, v in losses.items():
     #     print(f"{k} loss: {v.item():.6f}")
 
+    # Sky MLP loss — L1 on sky pixels only
+    if sky_rgb is not None and sky_mask_bool is not None and lambda_sky > 0:
+        losses["sky"] = lambda_sky * masked_l1_loss(sky_rgb, gt_rgb, sky_mask_bool)
+    else:
+        losses["sky"] = torch.tensor(0.0, device=rendered_rgb.device)
+
     # LPIPS loss (same sky mask applied)
     if lpips_fn is not None and lambda_lpips > 0:
         if valid_mask is not None:
@@ -658,6 +668,7 @@ def compute_photometric_loss(
         + losses["dssim"]
         + losses["lpips"]
         + losses["aniso"]
+        + losses["sky"]
 
     )
     return losses
@@ -1066,6 +1077,8 @@ def train_one_step_on_scene(
     views_per_step: int = 2,
     render_chunk_size: int = 2,
     lpips_fn=None,
+    sky_mlp=None,          # Optional[SkyMLP]
+    lambda_sky: float = 1.0,
 ):
     decoder.train()
     optimizer.zero_grad()
@@ -1153,6 +1166,7 @@ def train_one_step_on_scene(
     loss_color_sum = 0.0
     loss_scale_vol_reg_sum = 0.0
     loss_aniso_sum = 0.0
+    loss_sky_sum = 0.0
     delta_color_abs_mean_sum = 0.0
     rendered_rgbs_to_log = []
     gt_rgbs_to_log = []
@@ -1190,9 +1204,23 @@ def train_one_step_on_scene(
         sky_mask = sky_mask_all[view:view+1].to(rendered_rgb.device)   # [1,H,W]
         valid_mask = ~sky_mask
 
-        
+
         if rendered_rgb.ndim == 3:
-            rendered_rgb = rendered_rgb.unsqueeze(0) 
+            rendered_rgb = rendered_rgb.unsqueeze(0)
+
+        # Optional sky MLP: predict sky color from ray direction + global feat
+        sky_rgb = None
+        if sky_mlp is not None:
+            K = intrinsics[view].to(rendered_rgb.device)
+            E = extrinsics[view].to(rendered_rgb.device)
+            if E.shape == (3, 4):
+                bottom = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=E.dtype, device=E.device)
+                E = torch.cat([E, bottom], dim=0)
+            c2w = torch.linalg.inv(E)
+            ray_dirs = compute_ray_dirs_world(H, W, K, c2w)  # [H, W, 3]
+            global_feat = dec_in["dino_feat"].mean(0)         # [D]
+            sky_rgb_hwc = sky_mlp(ray_dirs, global_feat)      # [H, W, 3]
+            sky_rgb = sky_rgb_hwc.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
 
         # start = time.time()
         losses = compute_photometric_loss(
@@ -1202,6 +1230,9 @@ def train_one_step_on_scene(
             gt_rgb=gt_rgb,
             valid_mask=valid_mask,
             lpips_fn=lpips_fn,
+            sky_rgb=sky_rgb,
+            sky_mask_bool=sky_mask,
+            lambda_sky=lambda_sky,
         )
         # print(f"Compute photometric loss done. Time: {time.time() - start:.2f} seconds.")
 
@@ -1215,6 +1246,7 @@ def train_one_step_on_scene(
         loss_scale_vol_reg_sum = loss_scale_vol_reg_sum + losses["scale_vol_reg"].item()
         loss_lpips_sum = loss_lpips_sum + losses["lpips"].item()
         loss_aniso_sum = loss_aniso_sum + losses["aniso"].item()
+        loss_sky_sum = loss_sky_sum + losses["sky"].item()
         delta_color = decoder_out.get("delta_color", None)
         if delta_color is not None:
             dc = delta_color.detach()
@@ -1265,6 +1297,7 @@ def train_one_step_on_scene(
             "scale_vol_reg": loss_scale_vol_reg_sum / num_views,
             "lpips": loss_lpips_sum / num_views,
             "aniso": loss_aniso_sum / num_views,
+            "sky": loss_sky_sum / num_views,
         },
         "rendered_rgb": rendered_rgbs_to_log[0],
         "gt_rgb": gt_rgbs_to_log[0],
@@ -1292,6 +1325,8 @@ def train_one_group(
     sequence_length,
     supervision_mode,
     lpips_fn=None,
+    sky_mlp=None,
+    lambda_sky: float = 1.0,
 ):
     scene_names = [s["scene_name"] for s in group_scenes]
     scene_map = {s["scene_name"]: s for s in group_scenes}
@@ -1350,6 +1385,8 @@ def train_one_group(
             views_per_step=views_per_step,
             device=device,
             lpips_fn=lpips_fn,
+            sky_mlp=sky_mlp,
+            lambda_sky=lambda_sky,
         )
 
         step_logs.append({
@@ -1596,6 +1633,16 @@ def main():
     parser.add_argument("--perview-conf", action="store_true",
                         help="Compute confidence threshold per view instead of globally")
 
+    # Optional sky MLP head (directional sky color predictor)
+    parser.add_argument("--use-sky-mlp", action="store_true",
+                        help="Enable directional MLP sky color head")
+    parser.add_argument("--sky-mlp-hidden-dim", type=int, default=64)
+    parser.add_argument("--sky-mlp-num-freq", type=int, default=4,
+                        help="Sinusoidal positional-encoding freq bands for ray direction")
+    parser.add_argument("--sky-mlp-num-layers", type=int, default=3)
+    parser.add_argument("--lambda-sky", type=float, default=1.0,
+                        help="Weight for sky MLP L1 loss on sky-masked pixels")
+
     # sky mask
     parser.add_argument(
         "--cache-root",
@@ -1736,7 +1783,26 @@ def main():
         voxel_size=args.voxel_size,
     ).to(device)
 
-    optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
+    # Optional sky MLP (directional sky color predictor)
+    sky_mlp = None
+    if args.use_sky_mlp:
+        sky_mlp = SkyMLP(
+            global_feat_dim=args.feat_dim_out,
+            hidden_dim=args.sky_mlp_hidden_dim,
+            num_freq=args.sky_mlp_num_freq,
+            num_layers=args.sky_mlp_num_layers,
+        ).to(device)
+        print(f"[INFO] SkyMLP enabled: hidden={args.sky_mlp_hidden_dim} "
+              f"num_freq={args.sky_mlp_num_freq} num_layers={args.sky_mlp_num_layers} "
+              f"lambda_sky={args.lambda_sky}")
+
+    if sky_mlp is not None:
+        optimizer = torch.optim.Adam(
+            list(decoder.parameters()) + list(sky_mlp.parameters()),
+            lr=args.lr,
+        )
+    else:
+        optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
 
     lpips_fn = lpips.LPIPS(net="alex").cpu()
     lpips_fn.eval()
@@ -1786,6 +1852,8 @@ def main():
                 sequence_length=args.sequence_length,
                 supervision_mode=args.supervision_mode,
                 lpips_fn=lpips_fn,
+                sky_mlp=sky_mlp,
+                lambda_sky=args.lambda_sky,
             )
 
             if len(logs) == 0:

@@ -308,6 +308,7 @@ def compute_photometric_loss(
     lambda_dssim: float = 0,
     lambda_scale_vol: float = 1e-2,
     lambda_lpips: float = 0.05,
+    lambda_aniso: float = 0.05,
     lpips_fn=None,
 ) -> Dict[str, torch.Tensor]:
     losses = {}
@@ -366,6 +367,13 @@ def compute_photometric_loss(
     losses["scale_reg"] = lambda_scale * decoder_out["scales"].pow(2).mean()
     losses["scale_vol_reg"] = lambda_scale_vol * decoder_out["scales"].prod(dim=1).mean()
     losses["opacity_reg"] = lambda_opacity * decoder_out["opacity"].mean()
+
+    if lambda_aniso > 0:
+        _s = decoder_out["scales"]
+        _aniso_ratio = _s.max(dim=-1).values / (_s.mean(dim=-1) + 1e-6)
+        losses["aniso"] = lambda_aniso * (_aniso_ratio - 1.0).pow(2).mean()
+    else:
+        losses["aniso"] = torch.tensor(0.0, device=decoder_out["scales"].device)
     # losses["anchor_scale_reg"] = decoder_out["anchor_scale"].pow(2).mean()
 
     # # actual displacement regularization
@@ -406,6 +414,7 @@ def compute_photometric_loss(
         # + losses["disp_reg"]
         + losses["dssim"]
         + losses["lpips"]
+        + losses["aniso"]
 
     )
     return losses
@@ -749,6 +758,7 @@ def train_one_step_on_scene(
     loss_dssim_sum = 0.0
     loss_color_sum = 0.0
     loss_scale_vol_reg_sum = 0.0
+    loss_aniso_sum = 0.0
     delta_color_abs_mean_sum = 0.0
     rendered_rgbs_to_log = []
     gt_rgbs_to_log = []
@@ -809,6 +819,8 @@ def train_one_step_on_scene(
         loss_opacity_reg_sum = loss_opacity_reg_sum + losses["opacity_reg"].item()
         loss_color_sum = loss_color_sum + losses["color"].item()
         loss_scale_vol_reg_sum = loss_scale_vol_reg_sum + losses["scale_vol_reg"].item()
+        loss_lpips_sum = loss_lpips_sum + losses["lpips"].item()
+        loss_aniso_sum = loss_aniso_sum + losses["aniso"].item()
         delta_color = decoder_out.get("delta_color", None)
         if delta_color is not None:
             dc = delta_color.detach()
@@ -858,6 +870,7 @@ def train_one_step_on_scene(
             "color": loss_color_sum / num_views,
             "scale_vol_reg": loss_scale_vol_reg_sum / num_views,
             "lpips": loss_lpips_sum / num_views,
+            "aniso": loss_aniso_sum / num_views,
         },
         "rendered_rgb": rendered_rgbs_to_log[0],
         "gt_rgb": gt_rgbs_to_log[0],
@@ -1652,7 +1665,7 @@ def main():
         feat_mode=args.feat_mode,
         neighbor_patch_radius=args.neighbor_patch_radius,
         perview_conf=args.perview_conf,
-        # feat_dim_out=args.feat_dim_out,
+        feat_dim_out=args.feat_dim_out,
     )
 
     # 用第一個 scene warmup，拿 dino_dim

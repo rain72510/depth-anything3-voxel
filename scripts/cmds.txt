@@ -85,13 +85,24 @@ WANDB_MODE=online CUDA_VISIBLE_DEVICES=4 python scripts/train_voxel_decoder.py \
 
   exp10-remove-sky-lambda_scale-1e-1-scale-max-1vsize
 
-docker run --init -it -d \
-  --name liosam-humble-ros2 \
-  -v /etc/localtime:/etc/localtime:ro \
-  -v /etc/timezone:/etc/timezone:ro \
-  -v /tmp/.X11-unix:/tmp/.X11-unix \
-  -v /home/rain/datasets/out-ros2:/out \
-  -e DISPLAY=$DISPLAY \
-  --runtime=nvidia --gpus all \
-  liosam-humble-ros2 \
-  bash
+
+WANDB_MODE=online CUDA_VISIBLE_DEVICES=5 python scripts/train_voxel_decoder.py \
+  --dataset-root datasets/waymo \
+  --output-dir output_train_voxel_decoder \
+  --cache-root output_train_voxel_decoder/cache \
+  --scene-list-file scripts/waymo_static.txt \
+  --scene-filter-mode restrict \
+  --epochs 600 \
+  --voxel-size 0.4 \
+  --views-per-step 2 \
+  --max-depth 50 \
+  --conf-percentile 40 \
+  --feat-mode last2_avg \
+  --feat-dim-out 128 \
+  --val-every 10 \
+  --num-gaussians 4 \
+  --use-wandb \
+  --wandb-project voxel-anchored-3dgs \
+  --wandb-run-name exp12-4G-evenodd \
+  --wandb-log-train-images-every 10 \
+  --wandb-log-val-images

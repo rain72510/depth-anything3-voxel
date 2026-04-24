@@ -314,7 +314,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # voxel_to_gaussian_model = VoxelToGaussianModel(decoder).to(device)
 
-        # return prediction
+        return prediction
 
         # Export if requested
         if export_dir is not None:

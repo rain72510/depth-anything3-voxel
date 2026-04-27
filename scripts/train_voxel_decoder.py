@@ -120,6 +120,10 @@ def main():
     # shape supervision: match Gaussian scales to local point distribution std (voxel_var_points)
     parser.add_argument("--lambda-shape", type=float, default=0.0,
                         help="Weight for log-ratio match between Gaussian scales and per-voxel point std. Encourages Gaussians to fit local surface geometry. 0 = off.")
+    parser.add_argument("--lambda-normal-align", type=float, default=0.0,
+                        help="Per-Gaussian normal alignment: rotate each Gaussian so its smallest-scale axis matches the per-anchor normal proxy (axis of min voxel variance). 0 = off.")
+    parser.add_argument("--scale-clamp-mult", type=float, default=0.5,
+                        help="Max Gaussian scale = scale_clamp_mult * voxel_size. Default 0.5 (i.e., 0.2m at voxel_size=0.4). Increase to 1.0 or 2.0 to allow larger Gaussians for shape fitting.")
 
     # sky mask
     parser.add_argument(
@@ -259,6 +263,7 @@ def main():
         hidden_dim=args.hidden_dim,
         num_gaussians=args.num_gaussians,
         voxel_size=args.voxel_size,
+        scale_clamp_mult=args.scale_clamp_mult,
     ).to(device)
 
     # Optional sky MLP (directional sky color predictor)
@@ -336,6 +341,7 @@ def main():
                 lambda_normal=args.lambda_normal,
                 lambda_aniso=args.lambda_aniso,
                 lambda_shape=args.lambda_shape,
+                lambda_normal_align=args.lambda_normal_align,
             )
 
             if len(logs) == 0:

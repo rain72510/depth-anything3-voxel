@@ -77,6 +77,7 @@ class VoxelGaussianDecoder(nn.Module):
         # use_voxel_color: bool = False,
         color_residual_scale: float = 0.25,
         voxel_size: float = 0.4,
+        scale_clamp_mult: float = 0.5,   # max scale = scale_clamp_mult * voxel_size
     ):
         super().__init__()
 
@@ -92,6 +93,7 @@ class VoxelGaussianDecoder(nn.Module):
         self.voxel_size = voxel_size
         self.use_voxel_color = use_voxel_color
         self.color_residual_scale = color_residual_scale
+        self.scale_clamp_mult = scale_clamp_mult
 
         # print
         print(f"Initialized VoxelGaussianDecoder with dino_dim={dino_dim}, hidden_dim={hidden_dim}, num_gaussians={num_gaussians}, use_confidence={use_confidence}, use_cov_diag={use_cov_diag}, use_view_conditioning={use_view_conditioning}, use_distance={use_distance}, color_act={color_act}, voxel_size={voxel_size}, use_voxel_color={use_voxel_color}")
@@ -323,7 +325,7 @@ class VoxelGaussianDecoder(nn.Module):
         
         # scale_raw = self.scale_head(h).view(N, K, 3)               # [N, K, 3]
         # scales = gaussian_base_scale[:, None, :] * torch.sigmoid(scale_raw) + 1e-4
-        scales = (torch.exp(scale_raw) * (self.voxel_size * 0.1) + 1e-4).clamp(max=self.voxel_size * 0.5)
+        scales = (torch.exp(scale_raw) * (self.voxel_size * 0.1) + 1e-4).clamp(max=self.voxel_size * self.scale_clamp_mult)
         # scales = torch.full_like(scales, self.voxel_size * 0.5)
 
         quaternions = normalize_quaternion(quat_raw)

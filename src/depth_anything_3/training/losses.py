@@ -6,6 +6,55 @@ import torch
 import torch.nn.functional as F
 from depth_anything_3.utils.loss_utils import ssim
 
+def quaternion_to_rotmat(q: torch.Tensor) -> torch.Tensor:
+    """Convert quaternions (w, x, y, z) to rotation matrices.
+
+    q: [..., 4]
+    returns: [..., 3, 3]
+    """
+    # normalize for safety
+    q = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
+    w, x, y, z = q.unbind(-1)
+    R = torch.stack([
+        torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], dim=-1),
+        torch.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], dim=-1),
+        torch.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], dim=-1),
+    ], dim=-2)
+    return R
+
+
+def per_gaussian_normal_alignment_loss(
+    scales: torch.Tensor,            # [N, K, 3]
+    rotations: torch.Tensor,         # [N, K, 4]
+    voxel_var_points: torch.Tensor,  # [N, 3]
+):
+    """Encourage each Gaussian's smallest-scale axis (in world frame) to align
+    with the local surface normal — proxied by the axis of smallest variance
+    in the contributing-points distribution per anchor.
+
+    Axis-aligned approximation: works well when surfaces are roughly aligned
+    with world XYZ (driving: ground=Z-thin, walls=Y-thin or X-thin). For
+    arbitrary orientations, full eigendecomposition would be needed.
+    """
+    import torch.nn.functional as _F
+    # Surface normal target: axis of smallest per-anchor variance
+    target_axis = voxel_var_points.argmin(dim=-1)                      # [N]
+    target_normal = _F.one_hot(target_axis, num_classes=3).float().to(scales.device)  # [N, 3]
+
+    # Each Gaussian's smallest local-axis index
+    gauss_axis = scales.argmin(dim=-1)                                  # [N, K]
+    local_hot = _F.one_hot(gauss_axis, num_classes=3).float()           # [N, K, 3]
+
+    # Rotate that local axis into world frame
+    R = quaternion_to_rotmat(rotations)                                 # [N, K, 3, 3]
+    gauss_normal_world = (R @ local_hot.unsqueeze(-1)).squeeze(-1)      # [N, K, 3]
+
+    # Compare to target — sign-ambiguous (n vs -n same plane), so use abs
+    target_b = target_normal.unsqueeze(1)                               # [N, 1, 3]
+    cos_sim = (gauss_normal_world * target_b).sum(dim=-1)               # [N, K]
+    return (1.0 - cos_sim.abs()).mean()
+
+
 def masked_l1_loss(pred, gt, valid_mask, eps=1e-8):
     # pred, gt: [B,3,H,W]
     # valid_mask: [B,H,W] or [B,1,H,W], True=keep
@@ -87,6 +136,7 @@ def compute_photometric_loss(
     lambda_depth: float = 0.0,
     lambda_normal: float = 0.0,
     lambda_shape: float = 0.0,
+    lambda_normal_align: float = 0.0,
     lpips_fn=None,
     sky_rgb: torch.Tensor = None,         # [v,3,H,W] predicted sky, optional
     sky_mask_bool: torch.Tensor = None,   # [v,H,W] True=sky, optional
@@ -180,6 +230,22 @@ def compute_photometric_loss(
     else:
         losses["shape"] = torch.tensor(0.0, device=decoder_out["scales"].device)
 
+    # Per-Gaussian normal alignment: rotate each Gaussian's smallest local axis
+    # to match the per-anchor normal proxy (axis of min voxel variance).
+    if (
+        lambda_normal_align > 0
+        and "voxel_var_points" in voxel_dict
+        and voxel_dict["voxel_var_points"] is not None
+        and "rotations" in decoder_out
+    ):
+        losses["normal_align"] = lambda_normal_align * per_gaussian_normal_alignment_loss(
+            scales=decoder_out["scales"],
+            rotations=decoder_out["rotations"],
+            voxel_var_points=voxel_dict["voxel_var_points"].to(decoder_out["scales"].device),
+        )
+    else:
+        losses["normal_align"] = torch.tensor(0.0, device=decoder_out["scales"].device)
+
     # # actual displacement regularization
     # disp = decoder_out["offsets"] * decoder_out["anchor_scale"].unsqueeze(-1)
     # losses["disp_reg"] = disp.pow(2).mean()
@@ -261,6 +327,7 @@ def compute_photometric_loss(
         + losses["depth"]
         + losses["normal"]
         + losses["shape"]
+        + losses["normal_align"]
 
     )
     return losses

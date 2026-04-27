@@ -26,6 +26,7 @@ def train_one_step_on_scene(
     lambda_normal: float = 0.0,
     lambda_aniso: float = 0.05,
     lambda_shape: float = 0.0,
+    lambda_normal_align: float = 0.0,
 ):
     decoder.train()
     optimizer.zero_grad()
@@ -118,6 +119,7 @@ def train_one_step_on_scene(
     loss_depth_sum = 0.0
     loss_normal_sum = 0.0
     loss_shape_sum = 0.0
+    loss_normal_align_sum = 0.0
     delta_color_abs_mean_sum = 0.0
     rendered_rgbs_to_log = []
     gt_rgbs_to_log = []
@@ -202,6 +204,7 @@ def train_one_step_on_scene(
             lambda_normal=lambda_normal,
             lambda_aniso=lambda_aniso,
             lambda_shape=lambda_shape,
+            lambda_normal_align=lambda_normal_align,
             rendered_depth=rendered_depth_view,
             gt_depth=gt_depth_view,
             intrinsics=intr_view,
@@ -222,6 +225,7 @@ def train_one_step_on_scene(
         loss_depth_sum = loss_depth_sum + losses["depth"].item()
         loss_normal_sum = loss_normal_sum + losses["normal"].item()
         loss_shape_sum = loss_shape_sum + losses["shape"].item()
+        loss_normal_align_sum = loss_normal_align_sum + losses["normal_align"].item()
         delta_color = decoder_out.get("delta_color", None)
         if delta_color is not None:
             dc = delta_color.detach()
@@ -276,6 +280,7 @@ def train_one_step_on_scene(
             "depth": loss_depth_sum / num_views,
             "normal": loss_normal_sum / num_views,
             "shape": loss_shape_sum / num_views,
+            "normal_align": loss_normal_align_sum / num_views,
         },
         "rendered_rgb": rendered_rgbs_to_log[0],
         "gt_rgb": gt_rgbs_to_log[0],
@@ -309,6 +314,7 @@ def train_one_group(
     lambda_normal: float = 0.0,
     lambda_aniso: float = 0.05,
     lambda_shape: float = 0.0,
+    lambda_normal_align: float = 0.0,
 ):
     scene_names = [s["scene_name"] for s in group_scenes]
     scene_map = {s["scene_name"]: s for s in group_scenes}
@@ -373,6 +379,7 @@ def train_one_group(
             lambda_normal=lambda_normal,
             lambda_aniso=lambda_aniso,
             lambda_shape=lambda_shape,
+            lambda_normal_align=lambda_normal_align,
         )
 
         step_logs.append({

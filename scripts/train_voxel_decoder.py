@@ -124,6 +124,8 @@ def main():
                         help="Per-Gaussian normal alignment: rotate each Gaussian so its smallest-scale axis matches the per-anchor normal proxy (axis of min voxel variance). 0 = off.")
     parser.add_argument("--scale-clamp-mult", type=float, default=0.5,
                         help="Max Gaussian scale = scale_clamp_mult * voxel_size. Default 0.5 (i.e., 0.2m at voxel_size=0.4). Increase to 1.0 or 2.0 to allow larger Gaussians for shape fitting.")
+    parser.add_argument("--scale-clamp-distance-ref", type=float, default=0.0,
+                        help="Distance-adaptive scale clamp. 0 = static clamp. >0 = clamp scales with (1 + dist/ref) so far Gaussians can be larger (matches 1/depth image footprint). E.g., 10.0 means 5x clamp at 50m anchor distance. Recommended: 10-20 for driving scenes.")
 
     # sky mask
     parser.add_argument(
@@ -264,6 +266,7 @@ def main():
         num_gaussians=args.num_gaussians,
         voxel_size=args.voxel_size,
         scale_clamp_mult=args.scale_clamp_mult,
+        scale_clamp_distance_ref=args.scale_clamp_distance_ref,
     ).to(device)
 
     # Optional sky MLP (directional sky color predictor)

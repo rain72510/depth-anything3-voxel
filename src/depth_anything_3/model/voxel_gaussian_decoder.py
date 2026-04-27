@@ -78,6 +78,7 @@ class VoxelGaussianDecoder(nn.Module):
         color_residual_scale: float = 0.25,
         voxel_size: float = 0.4,
         scale_clamp_mult: float = 0.5,   # max scale = scale_clamp_mult * voxel_size
+        scale_clamp_distance_ref: float = 0.0,  # 0 = static clamp; >0 = adaptive: clamp = static * (1 + dist/ref)
     ):
         super().__init__()
 
@@ -94,6 +95,7 @@ class VoxelGaussianDecoder(nn.Module):
         self.use_voxel_color = use_voxel_color
         self.color_residual_scale = color_residual_scale
         self.scale_clamp_mult = scale_clamp_mult
+        self.scale_clamp_distance_ref = scale_clamp_distance_ref
 
         # print
         print(f"Initialized VoxelGaussianDecoder with dino_dim={dino_dim}, hidden_dim={hidden_dim}, num_gaussians={num_gaussians}, use_confidence={use_confidence}, use_cov_diag={use_cov_diag}, use_view_conditioning={use_view_conditioning}, use_distance={use_distance}, color_act={color_act}, voxel_size={voxel_size}, use_voxel_color={use_voxel_color}")
@@ -325,7 +327,23 @@ class VoxelGaussianDecoder(nn.Module):
         
         # scale_raw = self.scale_head(h).view(N, K, 3)               # [N, K, 3]
         # scales = gaussian_base_scale[:, None, :] * torch.sigmoid(scale_raw) + 1e-4
-        scales = (torch.exp(scale_raw) * (self.voxel_size * 0.1) + 1e-4).clamp(max=self.voxel_size * self.scale_clamp_mult)
+        # Distance-adaptive scale clamp: far Gaussians can grow larger to match
+        # image-space pixel coverage (which scales as 1/depth). When
+        # scale_clamp_distance_ref == 0, behaves as static clamp.
+        raw_scales = torch.exp(scale_raw) * (self.voxel_size * 0.1) + 1e-4
+        if self.scale_clamp_distance_ref > 0 and camera_xyz is not None:
+            cam = camera_xyz
+            if cam.shape[0] == 1 and anchor_xyz.shape[0] > 1:
+                cam = cam.expand(anchor_xyz.shape[0], -1)
+            dist = (anchor_xyz - cam).norm(dim=-1)                    # [N]
+            adaptive_clamp = (
+                self.voxel_size
+                * self.scale_clamp_mult
+                * (1.0 + dist / self.scale_clamp_distance_ref)
+            ).view(-1, 1, 1)                                          # [N, 1, 1]
+            scales = torch.minimum(raw_scales, adaptive_clamp.expand_as(raw_scales))
+        else:
+            scales = raw_scales.clamp(max=self.voxel_size * self.scale_clamp_mult)
         # scales = torch.full_like(scales, self.voxel_size * 0.5)
 
         quaternions = normalize_quaternion(quat_raw)

@@ -2,43 +2,16 @@
 # Module: validation
 
 import os
-import glob
-import json
-import argparse
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, Any
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import psutil
-import wandb
 import traceback
-import time
-from depth_anything_3.api import DepthAnything3
-from depth_anything_3.sparse_voxelizer import SparseVoxelizer
-from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
-from depth_anything_3.model.sky_mlp import SkyMLP, compute_ray_dirs_world
-from types import SimpleNamespace
-from PIL import Image
-import lpips
-from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj_mode, render_3dgs
-from depth_anything_3.specs import Gaussians
-from depth_anything_3.utils.gsply_helpers import export_ply
-from depth_anything_3.utils.loss_utils import ssim
-from PIL import Image
-import lpips
-import math
 
 # sibling imports (auto-generated)
 from depth_anything_3.training.rendering import render_views_from_decoder_output
-from depth_anything_3.training.data_prep import build_decoder_inputs, flatten_gaussians, build_renderer_gaussians
-from depth_anything_3.training.checkpoint_io import save_flat_scene_as_ply, save_gaussian_scene_npz
-from depth_anything_3.training.wandb_utils import make_wandb_image_triplet_with_mask
-from depth_anything_3.training.sky_mask import load_precomputed_sky_mask_subset, load_precomputed_sky_mask
+from depth_anything_3.training.data_prep import build_decoder_inputs
+from depth_anything_3.training.checkpoint_io import save_flat_scene_as_ply
+from depth_anything_3.training.sky_mask import load_precomputed_sky_mask
 from depth_anything_3.training.losses import masked_l1_loss
-from depth_anything_3.training.utils import select_valid_view_indices, save_tensor_image, save_diff_image, ensure_dir
+from depth_anything_3.training.utils import select_valid_view_indices, save_tensor_image, save_diff_image
 
 @torch.no_grad()
 def verify_scene_no_cache(

@@ -2,34 +2,7 @@
 # Module: sky_mask
 
 import os
-import glob
-import json
-import argparse
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, Any
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-import psutil
-import wandb
-import traceback
-import time
-from depth_anything_3.api import DepthAnything3
-from depth_anything_3.sparse_voxelizer import SparseVoxelizer
-from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
-from depth_anything_3.model.sky_mlp import SkyMLP, compute_ray_dirs_world
-from types import SimpleNamespace
-from PIL import Image
-import lpips
-from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj_mode, render_3dgs
-from depth_anything_3.specs import Gaussians
-from depth_anything_3.utils.gsply_helpers import export_ply
-from depth_anything_3.utils.loss_utils import ssim
-from PIL import Image
-import lpips
-import math
 
 def build_sky_mask_from_gt(
     images_u8: np.ndarray,   # [V,H,W,3], uint8

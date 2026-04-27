@@ -2,44 +2,15 @@
 # Module: train_step
 
 import os
-import glob
-import json
-import argparse
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, Any
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import psutil
-import wandb
-import traceback
-import time
-from depth_anything_3.api import DepthAnything3
-from depth_anything_3.sparse_voxelizer import SparseVoxelizer
 from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
-from depth_anything_3.model.sky_mlp import SkyMLP, compute_ray_dirs_world
-from types import SimpleNamespace
-from PIL import Image
-import lpips
-from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj_mode, render_3dgs
-from depth_anything_3.specs import Gaussians
-from depth_anything_3.utils.gsply_helpers import export_ply
-from depth_anything_3.utils.loss_utils import ssim
-from PIL import Image
-import lpips
-import math
+from depth_anything_3.model.sky_mlp import compute_ray_dirs_world
 
 # sibling imports (auto-generated)
 from depth_anything_3.training.losses import compute_photometric_loss
 from depth_anything_3.training.rendering import render_views_from_decoder_output
-from depth_anything_3.training.data_prep import flatten_gaussians, build_renderer_gaussians
 from depth_anything_3.training.scene_cache import prepare_scene_cache
 from depth_anything_3.training.scene_discovery import sample_even_odd_window
-from depth_anything_3.training.checkpoint_io import save_debug_ply_pair, save_recent_training_ply
-from depth_anything_3.training.wandb_utils import make_wandb_image_triplet_with_mask
-from depth_anything_3.training.utils import get_cpu_mem_stats, get_gpu_mem_stats, chunk_list, ensure_dir
 
 def train_one_step_on_scene(
     decoder: VoxelGaussianDecoder,

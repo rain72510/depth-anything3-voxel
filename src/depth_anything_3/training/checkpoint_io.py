@@ -71,11 +71,21 @@ def save_debug_ply_pair(
 
     prefix = f"step_{global_step:07d}_{scene_name}"
 
-    # 3DGS PLY
+    # 3DGS PLY (with learned colors)
     gs_path = os.path.join(debug_dir, prefix + "_gaussians.ply")
     save_flat_scene_as_ply(flat_scene, gs_path)
 
-    # Voxel XYZ PLY
+    # Geometry-only PLY: same Gaussians, uniform mid-gray color so geometry
+    # (positions, scales, rotations, opacity) is visible without color noise.
+    import torch as _torch
+    geom_scene = {
+        **flat_scene,
+        "colors": _torch.full_like(flat_scene["colors"], 0.5),
+    }
+    geom_path = os.path.join(debug_dir, prefix + "_geom.ply")
+    save_flat_scene_as_ply(geom_scene, geom_path)
+
+    # Voxel XYZ PLY (anchor scaffold)
     if voxel_mean_points is not None:
         from plyfile import PlyData, PlyElement
         import numpy as np
@@ -88,14 +98,15 @@ def save_debug_ply_pair(
         vox_path = os.path.join(debug_dir, prefix + "_voxels.ply")
         PlyData([el]).write(vox_path)
 
-    # Keep only last K pairs
+    # Keep only last K pairs (also clean up _geom.ply and _voxels.ply siblings)
     all_gs = sorted(_glob.glob(os.path.join(debug_dir, "step_*_gaussians.ply")), key=os.path.getmtime)
     if len(all_gs) > keep_last_k:
         for old_path in all_gs[:-keep_last_k]:
             os.remove(old_path)
-            vox_old = old_path.replace("_gaussians.ply", "_voxels.ply")
-            if os.path.exists(vox_old):
-                os.remove(vox_old)
+            for sibling_suffix in ("_voxels.ply", "_geom.ply"):
+                sibling = old_path.replace("_gaussians.ply", sibling_suffix)
+                if os.path.exists(sibling):
+                    os.remove(sibling)
 
 def save_recent_training_ply(
     flat_scene: dict,

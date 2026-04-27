@@ -22,6 +22,8 @@ def train_one_step_on_scene(
     lpips_fn=None,
     sky_mlp=None,          # Optional[SkyMLP]
     lambda_sky: float = 1.0,
+    lambda_depth: float = 0.0,
+    lambda_normal: float = 0.0,
 ):
     decoder.train()
     optimizer.zero_grad()
@@ -33,6 +35,7 @@ def train_one_step_on_scene(
     extrinsics = scene_cache["extrinsics"]    # [V,4,4] or [V,3,4]
     camera_xyz = scene_cache["camera_xyz"]      # [V,3]
     sky_mask_all = scene_cache["sky_mask"]   # [V,H,W]
+    gt_depth_all = scene_cache.get("depth", None)   # [V,H,W] DA3 depth, optional
 
 
     gt_images = (
@@ -110,6 +113,8 @@ def train_one_step_on_scene(
     loss_scale_vol_reg_sum = 0.0
     loss_aniso_sum = 0.0
     loss_sky_sum = 0.0
+    loss_depth_sum = 0.0
+    loss_normal_sum = 0.0
     delta_color_abs_mean_sum = 0.0
     rendered_rgbs_to_log = []
     gt_rgbs_to_log = []
@@ -147,9 +152,23 @@ def train_one_step_on_scene(
         sky_mask = sky_mask_all[view:view+1].to(rendered_rgb.device)   # [1,H,W]
         valid_mask = ~sky_mask
 
+        # Optional GT depth for depth/normal supervision
+        gt_depth_view = None
+        intr_view = None
+        if gt_depth_all is not None and (lambda_depth > 0 or lambda_normal > 0):
+            if isinstance(gt_depth_all, torch.Tensor):
+                gt_depth_view = gt_depth_all[view:view+1].to(rendered_rgb.device).float()
+            else:
+                gt_depth_view = torch.from_numpy(gt_depth_all[view:view+1]).to(rendered_rgb.device).float()
+            intr_view = intrinsics[view:view+1].to(rendered_rgb.device).float()
 
         if rendered_rgb.ndim == 3:
             rendered_rgb = rendered_rgb.unsqueeze(0)
+        # rendered_depth comes back from gsplat; make sure it's [v,H,W]
+        if rendered_depth is not None and rendered_depth.ndim == 2:
+            rendered_depth_view = rendered_depth.unsqueeze(0)
+        else:
+            rendered_depth_view = rendered_depth
 
         # Optional sky MLP: predict sky color from ray direction + global feat
         sky_rgb = None
@@ -176,6 +195,11 @@ def train_one_step_on_scene(
             sky_rgb=sky_rgb,
             sky_mask_bool=sky_mask,
             lambda_sky=lambda_sky,
+            lambda_depth=lambda_depth,
+            lambda_normal=lambda_normal,
+            rendered_depth=rendered_depth_view,
+            gt_depth=gt_depth_view,
+            intrinsics=intr_view,
         )
         # print(f"Compute photometric loss done. Time: {time.time() - start:.2f} seconds.")
 
@@ -190,6 +214,8 @@ def train_one_step_on_scene(
         loss_lpips_sum = loss_lpips_sum + losses["lpips"].item()
         loss_aniso_sum = loss_aniso_sum + losses["aniso"].item()
         loss_sky_sum = loss_sky_sum + losses["sky"].item()
+        loss_depth_sum = loss_depth_sum + losses["depth"].item()
+        loss_normal_sum = loss_normal_sum + losses["normal"].item()
         delta_color = decoder_out.get("delta_color", None)
         if delta_color is not None:
             dc = delta_color.detach()
@@ -241,6 +267,8 @@ def train_one_step_on_scene(
             "lpips": loss_lpips_sum / num_views,
             "aniso": loss_aniso_sum / num_views,
             "sky": loss_sky_sum / num_views,
+            "depth": loss_depth_sum / num_views,
+            "normal": loss_normal_sum / num_views,
         },
         "rendered_rgb": rendered_rgbs_to_log[0],
         "gt_rgb": gt_rgbs_to_log[0],
@@ -270,6 +298,8 @@ def train_one_group(
     lpips_fn=None,
     sky_mlp=None,
     lambda_sky: float = 1.0,
+    lambda_depth: float = 0.0,
+    lambda_normal: float = 0.0,
 ):
     scene_names = [s["scene_name"] for s in group_scenes]
     scene_map = {s["scene_name"]: s for s in group_scenes}
@@ -330,6 +360,8 @@ def train_one_group(
             lpips_fn=lpips_fn,
             sky_mlp=sky_mlp,
             lambda_sky=lambda_sky,
+            lambda_depth=lambda_depth,
+            lambda_normal=lambda_normal,
         )
 
         step_logs.append({

@@ -17,6 +17,54 @@ def masked_l1_loss(pred, gt, valid_mask, eps=1e-8):
     denom = valid_mask.sum() * pred.shape[1]
     return diff.sum() / denom.clamp_min(eps)
 
+
+def depth_to_normals(depth: torch.Tensor, intrinsics: torch.Tensor) -> torch.Tensor:
+    """Compute world-aligned per-pixel normals from depth + intrinsics.
+
+    depth: [B, H, W] (or [H, W])
+    intrinsics: [B, 3, 3] (or [3, 3])
+    returns: [B, H-2, W-2, 3] unit-norm normals (cropped 1px on each side
+             to keep finite differences valid)
+    """
+    if depth.ndim == 2:
+        depth = depth.unsqueeze(0)
+        intrinsics = intrinsics.unsqueeze(0)
+    B, H, W = depth.shape
+    fx = intrinsics[:, 0, 0].view(B, 1, 1)
+    fy = intrinsics[:, 1, 1].view(B, 1, 1)
+    cx = intrinsics[:, 0, 2].view(B, 1, 1)
+    cy = intrinsics[:, 1, 2].view(B, 1, 1)
+
+    u = torch.arange(W, device=depth.device, dtype=depth.dtype).view(1, 1, W).expand(B, H, W)
+    v = torch.arange(H, device=depth.device, dtype=depth.dtype).view(1, H, 1).expand(B, H, W)
+    X = (u - cx) * depth / fx
+    Y = (v - cy) * depth / fy
+    Z = depth
+    pts = torch.stack([X, Y, Z], dim=-1)  # [B, H, W, 3]
+
+    dx = pts[:, 1:-1, 2:, :] - pts[:, 1:-1, :-2, :]   # right - left
+    dy = pts[:, 2:, 1:-1, :] - pts[:, :-2, 1:-1, :]   # down - up
+    n = torch.cross(dx, dy, dim=-1)                    # [B, H-2, W-2, 3]
+    n = n / (n.norm(dim=-1, keepdim=True) + 1e-6)
+    return n
+
+
+def masked_normal_consistency_loss(
+    pred_depth: torch.Tensor,    # [B, H, W]
+    gt_depth: torch.Tensor,      # [B, H, W]
+    intrinsics: torch.Tensor,    # [B, 3, 3]
+    valid_mask: torch.Tensor,    # [B, H, W] bool
+    eps: float = 1e-8,
+):
+    """1 - cos(normal(pred_depth), normal(gt_depth)) averaged over masked pixels."""
+    n_pred = depth_to_normals(pred_depth, intrinsics)  # [B, H-2, W-2, 3]
+    n_gt = depth_to_normals(gt_depth, intrinsics)
+    cos = (n_pred * n_gt).sum(dim=-1)  # [B, H-2, W-2]
+    err = 1.0 - cos                    # 0 = perfect alignment, 2 = opposite
+    # crop mask to match (drop 1px border on each side)
+    m = valid_mask.float()[:, 1:-1, 1:-1]
+    return (err * m).sum() / m.sum().clamp_min(eps)
+
 def compute_photometric_loss(
     decoder_out: Dict[str, torch.Tensor],
     voxel_dict: Dict[str, Any],
@@ -36,9 +84,14 @@ def compute_photometric_loss(
     lambda_lpips: float = 0.05,
     lambda_aniso: float = 0.05,
     lambda_sky: float = 1.0,
+    lambda_depth: float = 0.0,
+    lambda_normal: float = 0.0,
     lpips_fn=None,
     sky_rgb: torch.Tensor = None,         # [v,3,H,W] predicted sky, optional
     sky_mask_bool: torch.Tensor = None,   # [v,H,W] True=sky, optional
+    rendered_depth: torch.Tensor = None,  # [v,H,W] gsplat output, optional
+    gt_depth: torch.Tensor = None,        # [v,H,W] DA3 depth, optional
+    intrinsics: torch.Tensor = None,      # [v,3,3] for normal computation, optional
 ) -> Dict[str, torch.Tensor]:
     losses = {}
 
@@ -124,6 +177,38 @@ def compute_photometric_loss(
     else:
         losses["sky"] = torch.tensor(0.0, device=rendered_rgb.device)
 
+    # Depth supervision: L1 between rendered_depth and DA3 depth on non-sky pixels.
+    if (
+        lambda_depth > 0
+        and rendered_depth is not None
+        and gt_depth is not None
+        and valid_mask is not None
+    ):
+        # rendered_depth: [v,H,W]; gt_depth: [v,H,W]; valid_mask: [v,H,W] True=non-sky
+        m = valid_mask.float()
+        diff = (rendered_depth - gt_depth.to(rendered_depth.device)).abs() * m
+        denom = m.sum().clamp_min(1e-8)
+        losses["depth"] = lambda_depth * (diff.sum() / denom)
+    else:
+        losses["depth"] = torch.tensor(0.0, device=rendered_rgb.device)
+
+    # Normal-from-depth consistency: 1 - cos(normal(rendered), normal(gt)) over non-sky.
+    if (
+        lambda_normal > 0
+        and rendered_depth is not None
+        and gt_depth is not None
+        and intrinsics is not None
+        and valid_mask is not None
+    ):
+        losses["normal"] = lambda_normal * masked_normal_consistency_loss(
+            rendered_depth,
+            gt_depth.to(rendered_depth.device),
+            intrinsics.to(rendered_depth.device),
+            valid_mask,
+        )
+    else:
+        losses["normal"] = torch.tensor(0.0, device=rendered_rgb.device)
+
     # LPIPS loss (same sky mask applied)
     if lpips_fn is not None and lambda_lpips > 0:
         if valid_mask is not None:
@@ -151,6 +236,8 @@ def compute_photometric_loss(
         + losses["lpips"]
         + losses["aniso"]
         + losses["sky"]
+        + losses["depth"]
+        + losses["normal"]
 
     )
     return losses

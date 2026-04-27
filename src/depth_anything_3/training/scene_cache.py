@@ -148,4 +148,6 @@ def prepare_scene_cache(
         "extrinsics": supervision_extrinsics,
         "camera_xyz": supervision_camera_xyz,
         "sky_mask": torch.from_numpy(supervision_sky_mask),
+        # DA3 depth on supervision frames; used for depth + normal supervision when enabled.
+        "depth": torch.from_numpy(supervision_prediction.depth).float(),  # [V,H,W]
     }

@@ -107,6 +107,12 @@ def main():
     parser.add_argument("--lambda-sky", type=float, default=1.0,
                         help="Weight for sky MLP L1 loss on sky-masked pixels")
 
+    # depth + normal supervision (uses DA3 depth as GT)
+    parser.add_argument("--lambda-depth", type=float, default=0.0,
+                        help="Weight for L1 between rendered_depth and DA3 depth (non-sky pixels). 0 = off.")
+    parser.add_argument("--lambda-normal", type=float, default=0.0,
+                        help="Weight for normal-consistency loss (1 - cos(normal(rendered), normal(GT))). 0 = off.")
+
     # sky mask
     parser.add_argument(
         "--cache-root",
@@ -318,6 +324,8 @@ def main():
                 lpips_fn=lpips_fn,
                 sky_mlp=sky_mlp,
                 lambda_sky=args.lambda_sky,
+                lambda_depth=args.lambda_depth,
+                lambda_normal=args.lambda_normal,
             )
 
             if len(logs) == 0:

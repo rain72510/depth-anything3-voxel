@@ -79,6 +79,7 @@ class VoxelGaussianDecoder(nn.Module):
         voxel_size: float = 0.4,
         scale_clamp_mult: float = 0.5,   # max scale = scale_clamp_mult * voxel_size
         scale_clamp_distance_ref: float = 0.0,  # 0 = static clamp; >0 = adaptive: clamp = static * (1 + dist/ref)
+        scale_init_mult: float = 0.1,    # initial scale = exp(scale_raw) * scale_init_mult * voxel_size; 0.1 was hardcoded default
     ):
         super().__init__()
 
@@ -96,6 +97,7 @@ class VoxelGaussianDecoder(nn.Module):
         self.color_residual_scale = color_residual_scale
         self.scale_clamp_mult = scale_clamp_mult
         self.scale_clamp_distance_ref = scale_clamp_distance_ref
+        self.scale_init_mult = scale_init_mult
 
         # print
         print(f"Initialized VoxelGaussianDecoder with dino_dim={dino_dim}, hidden_dim={hidden_dim}, num_gaussians={num_gaussians}, use_confidence={use_confidence}, use_cov_diag={use_cov_diag}, use_view_conditioning={use_view_conditioning}, use_distance={use_distance}, color_act={color_act}, voxel_size={voxel_size}, use_voxel_color={use_voxel_color}")
@@ -330,7 +332,7 @@ class VoxelGaussianDecoder(nn.Module):
         # Distance-adaptive scale clamp: far Gaussians can grow larger to match
         # image-space pixel coverage (which scales as 1/depth). When
         # scale_clamp_distance_ref == 0, behaves as static clamp.
-        raw_scales = torch.exp(scale_raw) * (self.voxel_size * 0.1) + 1e-4
+        raw_scales = torch.exp(scale_raw) * (self.voxel_size * self.scale_init_mult) + 1e-4
         if self.scale_clamp_distance_ref > 0 and camera_xyz is not None:
             cam = camera_xyz
             if cam.shape[0] == 1 and anchor_xyz.shape[0] > 1:

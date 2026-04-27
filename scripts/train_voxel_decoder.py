@@ -113,6 +113,14 @@ def main():
     parser.add_argument("--lambda-normal", type=float, default=0.0,
                         help="Weight for normal-consistency loss (1 - cos(normal(rendered), normal(GT))). 0 = off.")
 
+    # anisotropy regularizer (set 0 to allow naturally anisotropic Gaussians)
+    parser.add_argument("--lambda-aniso", type=float, default=0.05,
+                        help="Weight for anisotropy reg ((max_scale/mean_scale - 1)^2). Set 0 to allow flat/needle Gaussians for shape fitting.")
+
+    # shape supervision: match Gaussian scales to local point distribution std (voxel_var_points)
+    parser.add_argument("--lambda-shape", type=float, default=0.0,
+                        help="Weight for log-ratio match between Gaussian scales and per-voxel point std. Encourages Gaussians to fit local surface geometry. 0 = off.")
+
     # sky mask
     parser.add_argument(
         "--cache-root",
@@ -326,6 +334,8 @@ def main():
                 lambda_sky=args.lambda_sky,
                 lambda_depth=args.lambda_depth,
                 lambda_normal=args.lambda_normal,
+                lambda_aniso=args.lambda_aniso,
+                lambda_shape=args.lambda_shape,
             )
 
             if len(logs) == 0:

@@ -86,6 +86,7 @@ def compute_photometric_loss(
     lambda_sky: float = 1.0,
     lambda_depth: float = 0.0,
     lambda_normal: float = 0.0,
+    lambda_shape: float = 0.0,
     lpips_fn=None,
     sky_rgb: torch.Tensor = None,         # [v,3,H,W] predicted sky, optional
     sky_mask_bool: torch.Tensor = None,   # [v,H,W] True=sky, optional
@@ -157,6 +158,27 @@ def compute_photometric_loss(
     else:
         losses["aniso"] = torch.tensor(0.0, device=decoder_out["scales"].device)
     # losses["anchor_scale_reg"] = decoder_out["anchor_scale"].pow(2).mean()
+
+    # Shape supervision: match per-Gaussian scales to the local point distribution's std.
+    # voxel_var_points [N,3] is the variance of contributing 3D points per voxel; sqrt gives
+    # the local std along XYZ. Each anchor produces K Gaussians sharing the anchor; we
+    # constrain their scales toward the anchor's std so flat surfaces yield flat Gaussians,
+    # poles yield needles, etc. Per-Gaussian residual still allowed via the K freedom.
+    if (
+        lambda_shape > 0
+        and "voxel_var_points" in voxel_dict
+        and voxel_dict["voxel_var_points"] is not None
+    ):
+        target_std = voxel_dict["voxel_var_points"].clamp_min(1e-8).sqrt().to(
+            decoder_out["scales"].device
+        )                                          # [N, 3]
+        target_std = target_std.unsqueeze(1)       # [N, 1, 3] -> broadcasts over K
+        scales = decoder_out["scales"]             # [N, K, 3]
+        # log-ratio loss is scale-invariant; clamps prevent log(0)
+        log_ratio = (scales.clamp_min(1e-8) / target_std.clamp_min(1e-8)).log()
+        losses["shape"] = lambda_shape * log_ratio.pow(2).mean()
+    else:
+        losses["shape"] = torch.tensor(0.0, device=decoder_out["scales"].device)
 
     # # actual displacement regularization
     # disp = decoder_out["offsets"] * decoder_out["anchor_scale"].unsqueeze(-1)
@@ -238,6 +260,7 @@ def compute_photometric_loss(
         + losses["sky"]
         + losses["depth"]
         + losses["normal"]
+        + losses["shape"]
 
     )
     return losses

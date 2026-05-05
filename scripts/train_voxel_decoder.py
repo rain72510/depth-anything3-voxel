@@ -96,6 +96,10 @@ def main():
                         help="Neighboring patch radius for voxel feature aggregation (0=center only, 1=3x3, 2=5x5)")
     parser.add_argument("--perview-conf", action="store_true",
                         help="Compute confidence threshold per view instead of globally")
+    parser.add_argument("--voxel-size-dist-ref", type=float, default=0.0,
+                        help=">0 enables distance-adaptive voxel size; vsize = voxel_size * max(1, d/ref)^exp")
+    parser.add_argument("--voxel-size-exp", type=float, default=1.0,
+                        help="Exponent for adaptive sizing: 1.0 = linear-with-distance, 2.0 ≈ inverse-depth-uniform")
 
     # Optional sky MLP head (directional sky color predictor)
     parser.add_argument("--use-sky-mlp", action="store_true",
@@ -245,6 +249,8 @@ def main():
         neighbor_patch_radius=args.neighbor_patch_radius,
         perview_conf=args.perview_conf,
         feat_dim_out=args.feat_dim_out,
+        voxel_size_dist_ref=args.voxel_size_dist_ref,
+        voxel_size_exp=args.voxel_size_exp,
     )
 
     # 用第一個 scene warmup，拿 dino_dim

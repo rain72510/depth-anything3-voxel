@@ -14,17 +14,21 @@ class SparseVoxelizer:
         feat_dim_out: Optional[int] = None, # e.g. 256; None means keep original dim
         neighbor_patch_radius: int = 0,     # 0=center only, 1=3x3, 2=5x5 patch neighborhood
         perview_conf: bool = False,         # if True, compute conf threshold per view instead of globally
+        voxel_size_dist_ref: float = 0.0,   # >0 enables distance-adaptive sizing: vsize = voxel_size * max(1, d/ref)^exp
+        voxel_size_exp: float = 1.0,        # 1.0 = linear-with-distance, 2.0 ≈ inverse-depth-uniform sampling
     ):
         self.max_depth = max_depth
         self.voxel_size = voxel_size
         # self.voxel_size = 0.1
         self.conf_percentile = conf_percentile
-        self.truncation_band = truncation_band 
+        self.truncation_band = truncation_band
         self.feat_mode = feat_mode
         self.patch_size = patch_size
         self.feat_dim_out = feat_dim_out
         self.neighbor_patch_radius = neighbor_patch_radius
         self.perview_conf = perview_conf
+        self.voxel_size_dist_ref = voxel_size_dist_ref
+        self.voxel_size_exp = voxel_size_exp
 
     @torch.no_grad()
     def voxelize_prediction(self, prediction: Any) -> Dict[str, Any]:
@@ -64,9 +68,23 @@ class SparseVoxelizer:
 
         if world_points.shape[0] == 0:
             return {"num_voxels": 0}
-        
+
         # 4. Voxelization
-        voxel_coords = torch.floor(world_points / self.voxel_size).long()
+        # Distance-adaptive voxel size: when voxel_size_dist_ref > 0, points farther
+        # from the source camera get coarser voxels (saves anchors in regions where
+        # image-space pixel area covers more world-space anyway). vsize stays at
+        # self.voxel_size for d <= ref and grows as (d/ref)^exp beyond.
+        if self.voxel_size_dist_ref > 0.0:
+            E_h = self._as_homogeneous_batch(extrinsics)
+            c2w = torch.inverse(E_h)
+            cam_xyz = c2w[:, :3, 3]                                    # [V, 3]
+            point_cam = cam_xyz[view_ids]                              # [N, 3]
+            point_dist = (world_points - point_cam).norm(dim=-1)       # [N]
+            ratio = (point_dist / self.voxel_size_dist_ref).clamp_min(1.0)
+            vsize_per_point = self.voxel_size * (ratio ** self.voxel_size_exp)  # [N]
+            voxel_coords = torch.floor(world_points / vsize_per_point.unsqueeze(-1)).long()
+        else:
+            voxel_coords = torch.floor(world_points / self.voxel_size).long()
         unique_voxels, inverse_indices = torch.unique(voxel_coords, dim=0, return_inverse=True)
 
         num_unique = unique_voxels.shape[0]
@@ -158,8 +176,14 @@ class SparseVoxelizer:
         # ---------------------------------------------------
         # F. bbox
         # ---------------------------------------------------
-        bbox_min = unique_voxels.min(dim=0)[0] * self.voxel_size
-        bbox_max = (unique_voxels.max(dim=0)[0] + 1) * self.voxel_size
+        if self.voxel_size_dist_ref > 0.0:
+            # Adaptive sizing: voxel coords are in heterogeneous grids; derive bbox
+            # from the actual world points instead of from voxel coords * size.
+            bbox_min = world_points.min(dim=0)[0]
+            bbox_max = world_points.max(dim=0)[0]
+        else:
+            bbox_min = unique_voxels.min(dim=0)[0] * self.voxel_size
+            bbox_max = (unique_voxels.max(dim=0)[0] + 1) * self.voxel_size
         bbox_extent = bbox_max - bbox_min
 
         # ---------------------------------------------------

@@ -231,8 +231,17 @@ def train_one_step_on_scene(
             dc = delta_color.detach()
             delta_color_abs_mean_sum += dc.abs().mean().item()
 
+        # Composite sky-MLP output into the *displayed* render so W&B panels
+        # show what the full model produces (gsplat foreground + sky-MLP sky),
+        # not just the bare gsplat output. The training loss already has its
+        # own sky-MLP term — this only affects the logged image.
+        display_rgb = rendered_rgb
+        if sky_rgb is not None and sky_mask is not None:
+            sm3 = sky_mask.unsqueeze(1).float().expand_as(rendered_rgb)
+            display_rgb = rendered_rgb * (1.0 - sm3) + sky_rgb * sm3
+
         if i == 0:
-            rendered_rgbs_to_log.append(rendered_rgb.detach().cpu())
+            rendered_rgbs_to_log.append(display_rgb.detach().cpu())
             gt_rgbs_to_log.append(gt_rgb.detach().cpu())
             sky_masks_to_log = sky_mask.detach().cpu()
             flat_scene_stats = {

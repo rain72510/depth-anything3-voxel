@@ -68,6 +68,12 @@ def verify_scene_no_cache(
         extra_kwargs = {}
         if decoder_inputs.get("voxel_pixel_features", None) is not None:
             extra_kwargs["voxel_pixel_features"] = decoder_inputs["voxel_pixel_features"]
+        if decoder_inputs.get("image_dino_feats", None) is not None:
+            extra_kwargs["image_dino_feats"] = decoder_inputs["image_dino_feats"]
+            extra_kwargs["raw_images"] = decoder_inputs["raw_images"]
+            extra_kwargs["intrinsics_v"] = decoder_inputs["intrinsics_v"]
+            extra_kwargs["extrinsics_v"] = decoder_inputs["extrinsics_v"]
+            extra_kwargs["conf_map"] = decoder_inputs["raw_conf"]
         decoder_out = decoder(
             anchor_xyz=decoder_inputs["anchor_xyz"],
             camera_xyz=camera_xyz[view:view+1],

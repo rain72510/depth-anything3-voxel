@@ -41,6 +41,33 @@ def build_decoder_inputs(voxel_dict: Dict[str, Any], device: torch.device) -> Di
     if voxel_pixel_features is not None:
         voxel_pixel_features = voxel_pixel_features.to(device)
 
+    # v3 inputs (per-view image-space DINO + camera params + raw RGB + per-pixel conf)
+    image_dino_feats = voxel_dict.get("image_dino_feats", None)
+    if image_dino_feats is not None:
+        image_dino_feats = image_dino_feats.to(device)
+
+    intrinsics_v = voxel_dict.get("intrinsics_v", None)
+    if intrinsics_v is not None:
+        intrinsics_v = intrinsics_v.to(device).float()
+
+    extrinsics_v = voxel_dict.get("extrinsics_v", None)
+    if extrinsics_v is not None:
+        extrinsics_v = extrinsics_v.to(device).float()
+
+    raw_images_uint8 = voxel_dict.get("raw_images", None)
+    raw_images = None
+    if raw_images_uint8 is not None:
+        # voxelizer stored uint8 [V, H, W, 3]; we want float [V, 3, H, W] in [0, 1]
+        raw_images = raw_images_uint8.to(device).float()
+        if raw_images.max() > 1.0:
+            raw_images = raw_images / 255.0
+        if raw_images.dim() == 4 and raw_images.shape[-1] == 3:
+            raw_images = raw_images.permute(0, 3, 1, 2).contiguous()
+
+    raw_conf = voxel_dict.get("raw_conf", None)
+    if raw_conf is not None:
+        raw_conf = raw_conf.to(device).float()
+
     return {
         "anchor_xyz": anchor_xyz,   # [K, 3]
         "dino_feat": dino_feat,     # [K, C]
@@ -48,6 +75,12 @@ def build_decoder_inputs(voxel_dict: Dict[str, Any], device: torch.device) -> Di
         "cov_diag": cov_diag,       # [K, 3]
         "voxel_colors": voxel_colors,
         "voxel_pixel_features": voxel_pixel_features,  # [K, C_full] fp16 or None (v2 only)
+        # v3 inputs (None when keep_image_features=False)
+        "image_dino_feats": image_dino_feats,  # [V, Hf, Wf, C_full]
+        "intrinsics_v": intrinsics_v,          # [V, 3, 3]
+        "extrinsics_v": extrinsics_v,          # [V, 3, 4] or [V, 4, 4]
+        "raw_images": raw_images,              # [V, 3, H, W] in [0, 1]
+        "raw_conf": raw_conf,                  # [V, H, W]
     }
 
 def flatten_gaussians(out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

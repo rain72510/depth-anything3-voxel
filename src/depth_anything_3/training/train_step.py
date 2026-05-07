@@ -132,6 +132,13 @@ def train_one_step_on_scene(
         extra_kwargs = {}
         if dec_in.get("voxel_pixel_features", None) is not None:
             extra_kwargs["voxel_pixel_features"] = dec_in["voxel_pixel_features"]
+        # v3 inputs: per-view image-space DINO + camera params + raw RGB + per-pixel conf
+        if dec_in.get("image_dino_feats", None) is not None:
+            extra_kwargs["image_dino_feats"] = dec_in["image_dino_feats"]
+            extra_kwargs["raw_images"] = dec_in["raw_images"]
+            extra_kwargs["intrinsics_v"] = dec_in["intrinsics_v"]
+            extra_kwargs["extrinsics_v"] = dec_in["extrinsics_v"]
+            extra_kwargs["conf_map"] = dec_in["raw_conf"]
         decoder_out = decoder(
             anchor_xyz=dec_in["anchor_xyz"],
             camera_xyz=camera_xyz[view:view+1],  # select one view's camera_xyz at a time, shape [1,3]

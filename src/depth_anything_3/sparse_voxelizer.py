@@ -17,6 +17,7 @@ class SparseVoxelizer:
         voxel_size_dist_ref: float = 0.0,   # >0 enables distance-adaptive sizing: vsize = voxel_size * max(1, d/ref)^exp
         voxel_size_exp: float = 1.0,        # 1.0 = linear-with-distance, 2.0 ≈ inverse-depth-uniform sampling
         keep_pixel_features: bool = False,  # v2: also aggregate full-dim DINO per voxel for appearance head
+        keep_image_features: bool = False,  # v3: keep per-view image-space DINO + camera params for per-Gaussian projection
     ):
         self.max_depth = max_depth
         self.voxel_size = voxel_size
@@ -31,6 +32,7 @@ class SparseVoxelizer:
         self.voxel_size_dist_ref = voxel_size_dist_ref
         self.voxel_size_exp = voxel_size_exp
         self.keep_pixel_features = keep_pixel_features
+        self.keep_image_features = keep_image_features
         self.pixel_feature_dtype = torch.float16
 
     @torch.no_grad()
@@ -174,6 +176,7 @@ class SparseVoxelizer:
         )
 
         voxel_pixel_features = None
+        image_dino_feats = None  # v3: per-view image-space DINO patch features
         if raw_feats is not None:
             voxel_features = self._aggregate_voxel_features_from_tokens_chunked(
                 raw_feats=raw_feats,
@@ -199,6 +202,15 @@ class SparseVoxelizer:
                     image_hw=depth.shape[-2:],
                     device=device,
                     chunk_size=200000,
+                )
+
+            if self.keep_image_features:
+                # Same layer-combination as the geometry path; full-dim, fp16,
+                # stored as [V, Hf, Wf, C_full] for v3 per-Gaussian projection.
+                image_dino_feats = self._extract_image_dino_feats(
+                    raw_feats=raw_feats,
+                    image_hw=depth.shape[-2:],
+                    device=device,
                 )
 
         # ---------------------------------------------------
@@ -255,6 +267,12 @@ class SparseVoxelizer:
             "voxel_view_counts": voxel_view_counts,     # (K,)
             "voxel_features": voxel_features,           # (K, C) or None
             "voxel_pixel_features": voxel_pixel_features,  # (K, C_full) fp16 or None — v2 appearance head input
+            "image_dino_feats": image_dino_feats,        # [V, Hf, Wf, C_full] fp16 or None — v3 per-Gaussian projection input
+            "intrinsics_v": intrinsics if self.keep_image_features else None,    # [V, 3, 3]
+            "extrinsics_v": extrinsics if self.keep_image_features else None,    # [V, 3, 4] or [V, 4, 4]
+            "image_hw": tuple(depth.shape[-2:]) if self.keep_image_features else None,
+            "raw_images": images if self.keep_image_features else None,          # [V, H, W, 3] uint8
+            "raw_conf": conf if self.keep_image_features else None,              # [V, H, W]
             "voxel_confidence": voxel_confidence,
             "num_voxels": int(num_unique),
             "num_points": int(num_points),
@@ -364,6 +382,27 @@ class SparseVoxelizer:
         voxel_counts = voxel_point_counts.unsqueeze(-1).clamp_min(1).to(torch.float32)
         voxel_features = voxel_feature_sum / voxel_counts
         return voxel_features
+
+    def _extract_image_dino_feats(self, raw_feats, image_hw, device):
+        """v3 path: keep per-view image-space DINO patch features at full dim, fp16.
+        Returns [V, Hf, Wf, C_full]. Same layer combination as the geometry path.
+        Memory: V × Hf × Wf × C_full × 2 bytes (~70 MB at V=12, Hf×Wf=925, C=3072)."""
+        if self.feat_mode == "last":
+            feat_tokens = raw_feats[3][0]
+        elif self.feat_mode == "last2_avg":
+            feat_tokens = 0.5 * (raw_feats[2][0] + raw_feats[3][0])
+        elif self.feat_mode == "all4_avg":
+            feat_tokens = sum(raw_feats[i][0] for i in range(4)) / 4.0
+        else:
+            raise ValueError(f"Unknown feat_mode: {self.feat_mode}")
+
+        feat_tokens = feat_tokens[0].to(device)  # [V, Ntok, C_full]
+        V, Ntok, C_full = feat_tokens.shape
+        H, W = image_hw
+        patch = self.patch_size
+        Hf, Wf = H // patch, W // patch
+        assert Ntok == Hf * Wf, f"Ntok={Ntok}, expected {Hf * Wf}"
+        return feat_tokens.reshape(V, Hf, Wf, C_full).to(self.pixel_feature_dtype)
 
     def _aggregate_full_dim_pixel_features(
         self,

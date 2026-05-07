@@ -10,6 +10,7 @@ from depth_anything_3.api import DepthAnything3
 from depth_anything_3.sparse_voxelizer import SparseVoxelizer
 from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
 from depth_anything_3.model.voxel_gaussian_decoder_v2 import VoxelGaussianDecoderV2
+from depth_anything_3.model.voxel_gaussian_decoder_v3 import VoxelGaussianDecoderV3
 from depth_anything_3.model.sky_mlp import SkyMLP
 import lpips
 import lpips
@@ -145,10 +146,12 @@ def main():
     # decoder params
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-gaussians", type=int, default=4)
-    parser.add_argument("--decoder-version", type=str, default="v1", choices=["v1", "v2"],
-                        help="v1 = single shared decoder; v2 = split GeometryHead + AppearanceHead with pixel-aligned appearance feature")
+    parser.add_argument("--decoder-version", type=str, default="v1", choices=["v1", "v2", "v3"],
+                        help="v1 = single shared decoder; v2 = split heads with per-anchor MEAN full-dim DINO appearance feature; v3 = split heads with per-Gaussian pixel-projected DINO + raw RGB appearance")
     parser.add_argument("--keep-pixel-features", action="store_true",
                         help="Aggregate full-dim DINO per voxel (required for v2)")
+    parser.add_argument("--keep-image-features", action="store_true",
+                        help="Keep per-view image-space DINO + camera params + raw RGB (required for v3)")
 
     # save ckpt
     parser.add_argument("--save-every", type=int, default=1)
@@ -248,6 +251,9 @@ def main():
     keep_pixel_features = args.keep_pixel_features or args.decoder_version == "v2"
     if args.decoder_version == "v2" and not args.keep_pixel_features:
         print("[INFO] --decoder-version v2 implies --keep-pixel-features; enabling automatically")
+    keep_image_features = args.keep_image_features or args.decoder_version == "v3"
+    if args.decoder_version == "v3" and not args.keep_image_features:
+        print("[INFO] --decoder-version v3 implies --keep-image-features; enabling automatically")
 
     voxelizer = SparseVoxelizer(
         max_depth=args.max_depth,
@@ -261,6 +267,7 @@ def main():
         voxel_size_dist_ref=args.voxel_size_dist_ref,
         voxel_size_exp=args.voxel_size_exp,
         keep_pixel_features=keep_pixel_features,
+        keep_image_features=keep_image_features,
     )
 
     # 用第一個 scene warmup，拿 dino_dim
@@ -278,7 +285,21 @@ def main():
 
     dino_dim = voxel_dict["voxel_features"].shape[1]
 
-    if args.decoder_version == "v2":
+    if args.decoder_version == "v3":
+        if voxel_dict.get("image_dino_feats", None) is None:
+            raise RuntimeError("v3 decoder needs image_dino_feats; check --keep-image-features wiring")
+        pixel_dim = voxel_dict["image_dino_feats"].shape[-1]
+        decoder = VoxelGaussianDecoderV3(
+            dino_dim=dino_dim,
+            pixel_dim=pixel_dim,
+            hidden_dim=args.hidden_dim,
+            num_gaussians=args.num_gaussians,
+            voxel_size=args.voxel_size,
+            scale_clamp_mult=args.scale_clamp_mult,
+            scale_clamp_distance_ref=args.scale_clamp_distance_ref,
+            scale_init_mult=args.scale_init_mult,
+        ).to(device)
+    elif args.decoder_version == "v2":
         if voxel_dict.get("voxel_pixel_features", None) is None:
             raise RuntimeError("v2 decoder needs voxel_pixel_features; check --keep-pixel-features wiring")
         pixel_dim = voxel_dict["voxel_pixel_features"].shape[1]

@@ -81,8 +81,19 @@ class SparseVoxelizer:
             point_cam = cam_xyz[view_ids]                              # [N, 3]
             point_dist = (world_points - point_cam).norm(dim=-1)       # [N]
             ratio = (point_dist / self.voxel_size_dist_ref).clamp_min(1.0)
-            vsize_per_point = self.voxel_size * (ratio ** self.voxel_size_exp)  # [N]
-            voxel_coords = torch.floor(world_points / vsize_per_point.unsqueeze(-1)).long()
+            # Quantize ratio into log2 depth bins so all points within a bin share
+            # the same vsize, and the bin id prefix prevents cross-bin coord
+            # collisions (a real bug — without this, with exp=2 a 5 m point and a
+            # 20 m point can map to the same voxel coord and torch.unique merges
+            # them, producing a degenerate scaffold and all-black renders).
+            bin_id = ratio.log2().floor().clamp_min(0).long()                  # [N]
+            bin_ratio = (2.0 ** bin_id.float())                                # [N]
+            vsize_per_point = self.voxel_size * (bin_ratio ** self.voxel_size_exp)  # [N]
+            voxel_coords_3d = torch.floor(world_points / vsize_per_point.unsqueeze(-1)).long()
+            # 4-D coords: [bin_id, vx, vy, vz]; downstream code that touches
+            # `unique_voxels` either ignores extra dims or operates in adaptive
+            # mode (bbox computed from world_points instead).
+            voxel_coords = torch.cat([bin_id.unsqueeze(-1), voxel_coords_3d], dim=-1)
         else:
             voxel_coords = torch.floor(world_points / self.voxel_size).long()
         unique_voxels, inverse_indices = torch.unique(voxel_coords, dim=0, return_inverse=True)

@@ -21,6 +21,9 @@ def save_gaussian_scene_npz(scene: Dict[str, torch.Tensor], path: str):
         colors=scene["colors"].detach().cpu().numpy(),
     )
 
+SH_C0 = 0.28209479177387814  # 1 / (2 sqrt(pi)) — DC SH coefficient
+
+
 def save_flat_scene_as_ply(
     flat_scene: dict,
     save_path: str,
@@ -32,8 +35,15 @@ def save_flat_scene_as_ply(
         means3D   [M,3]
         scales    [M,3]
         rotations [M,4]
-        opacity   [M,1] or [M]
-        colors    [M,3]   in [0,1]
+        opacity   [M,1] or [M]   in [0,1] (post-sigmoid)
+        colors    [M,3]          in [0,1] (post-sigmoid)
+
+    The 3DGS PLY format expected by viewers (SuperSplat, gsplat-viewer, etc.)
+    stores `f_dc_*` in SH-DC convention `(rgb - 0.5) / SH_C0` and `opacity`
+    in logit space. Our decoder outputs already-sigmoided values, so we
+    invert those transforms here before handing to `export_ply`. (Without
+    this conversion, viewers display a washed-out gray scene because they
+    apply the inverse transforms expecting unencoded values.)
     """
     means = flat_scene["means3D"].detach()
     scales = flat_scene["scales"].detach().clamp_min(1e-8)
@@ -41,15 +51,19 @@ def save_flat_scene_as_ply(
     opacities = flat_scene["opacity"].detach().reshape(-1).clamp(1e-6, 1 - 1e-6)
     colors = flat_scene["colors"].detach().clamp(0.0, 1.0)
 
-    # SH degree 0 only: [M,3,1]
-    harmonics = colors.unsqueeze(-1)
+    # Convert to viewer-compatible 3DGS PLY conventions.
+    f_dc = (colors - 0.5) / SH_C0                                          # [M, 3]
+    opacity_logit = torch.log(opacities / (1.0 - opacities))               # [M]
+
+    # SH degree 0 only: [M, 3, 1]
+    harmonics = f_dc.unsqueeze(-1)
 
     export_ply(
         means=means,
         scales=scales,
         rotations=rotations,
         harmonics=harmonics,
-        opacities=opacities,
+        opacities=opacity_logit,
         path=Path(save_path),
         shift_and_scale=shift_and_scale,
         save_sh_dc_only=save_sh_dc_only,

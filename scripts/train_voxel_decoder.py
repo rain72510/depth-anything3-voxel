@@ -9,6 +9,7 @@ import wandb
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.sparse_voxelizer import SparseVoxelizer
 from depth_anything_3.model.voxel_gaussian_decoder import VoxelGaussianDecoder
+from depth_anything_3.model.voxel_gaussian_decoder_v2 import VoxelGaussianDecoderV2
 from depth_anything_3.model.sky_mlp import SkyMLP
 import lpips
 import lpips
@@ -144,6 +145,10 @@ def main():
     # decoder params
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-gaussians", type=int, default=4)
+    parser.add_argument("--decoder-version", type=str, default="v1", choices=["v1", "v2"],
+                        help="v1 = single shared decoder; v2 = split GeometryHead + AppearanceHead with pixel-aligned appearance feature")
+    parser.add_argument("--keep-pixel-features", action="store_true",
+                        help="Aggregate full-dim DINO per voxel (required for v2)")
 
     # save ckpt
     parser.add_argument("--save-every", type=int, default=1)
@@ -240,6 +245,10 @@ def main():
     for p in model.parameters():
         p.requires_grad = False
 
+    keep_pixel_features = args.keep_pixel_features or args.decoder_version == "v2"
+    if args.decoder_version == "v2" and not args.keep_pixel_features:
+        print("[INFO] --decoder-version v2 implies --keep-pixel-features; enabling automatically")
+
     voxelizer = SparseVoxelizer(
         max_depth=args.max_depth,
         voxel_size=args.voxel_size,
@@ -251,6 +260,7 @@ def main():
         feat_dim_out=args.feat_dim_out,
         voxel_size_dist_ref=args.voxel_size_dist_ref,
         voxel_size_exp=args.voxel_size_exp,
+        keep_pixel_features=keep_pixel_features,
     )
 
     # 用第一個 scene warmup，拿 dino_dim
@@ -268,15 +278,37 @@ def main():
 
     dino_dim = voxel_dict["voxel_features"].shape[1]
 
-    decoder = VoxelGaussianDecoder(
-        dino_dim=dino_dim,
-        hidden_dim=args.hidden_dim,
-        num_gaussians=args.num_gaussians,
-        voxel_size=args.voxel_size,
-        scale_clamp_mult=args.scale_clamp_mult,
-        scale_clamp_distance_ref=args.scale_clamp_distance_ref,
-        scale_init_mult=args.scale_init_mult,
-    ).to(device)
+    if args.decoder_version == "v2":
+        if voxel_dict.get("voxel_pixel_features", None) is None:
+            raise RuntimeError("v2 decoder needs voxel_pixel_features; check --keep-pixel-features wiring")
+        pixel_dim = voxel_dict["voxel_pixel_features"].shape[1]
+        decoder = VoxelGaussianDecoderV2(
+            dino_dim=dino_dim,
+            pixel_dim=pixel_dim,
+            hidden_dim=args.hidden_dim,
+            num_gaussians=args.num_gaussians,
+            voxel_size=args.voxel_size,
+            scale_clamp_mult=args.scale_clamp_mult,
+            scale_clamp_distance_ref=args.scale_clamp_distance_ref,
+            scale_init_mult=args.scale_init_mult,
+        ).to(device)
+    else:
+        decoder = VoxelGaussianDecoder(
+            dino_dim=dino_dim,
+            hidden_dim=args.hidden_dim,
+            num_gaussians=args.num_gaussians,
+            voxel_size=args.voxel_size,
+            scale_clamp_mult=args.scale_clamp_mult,
+            scale_clamp_distance_ref=args.scale_clamp_distance_ref,
+            scale_init_mult=args.scale_init_mult,
+        ).to(device)
+
+    # Free warmup voxel_dict before training begins — the pred + voxel_dict here
+    # were only used to probe dino_dim/pixel_dim and would otherwise pin ~1+ GB
+    # of GPU memory through the rest of main() (matters most for v2 where the
+    # full-dim pixel feature tensor is the dominant cost).
+    del voxel_dict, pred
+    torch.cuda.empty_cache()
 
     # Optional sky MLP (directional sky color predictor)
     sky_mlp = None

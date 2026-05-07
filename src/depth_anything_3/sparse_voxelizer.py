@@ -16,6 +16,7 @@ class SparseVoxelizer:
         perview_conf: bool = False,         # if True, compute conf threshold per view instead of globally
         voxel_size_dist_ref: float = 0.0,   # >0 enables distance-adaptive sizing: vsize = voxel_size * max(1, d/ref)^exp
         voxel_size_exp: float = 1.0,        # 1.0 = linear-with-distance, 2.0 ≈ inverse-depth-uniform sampling
+        keep_pixel_features: bool = False,  # v2: also aggregate full-dim DINO per voxel for appearance head
     ):
         self.max_depth = max_depth
         self.voxel_size = voxel_size
@@ -29,6 +30,8 @@ class SparseVoxelizer:
         self.perview_conf = perview_conf
         self.voxel_size_dist_ref = voxel_size_dist_ref
         self.voxel_size_exp = voxel_size_exp
+        self.keep_pixel_features = keep_pixel_features
+        self.pixel_feature_dtype = torch.float16
 
     @torch.no_grad()
     def voxelize_prediction(self, prediction: Any) -> Dict[str, Any]:
@@ -170,6 +173,7 @@ class SparseVoxelizer:
             torch.ones(unique_voxel_view_pairs.shape[0], device=device, dtype=torch.long)
         )
 
+        voxel_pixel_features = None
         if raw_feats is not None:
             voxel_features = self._aggregate_voxel_features_from_tokens_chunked(
                 raw_feats=raw_feats,
@@ -183,6 +187,19 @@ class SparseVoxelizer:
                 chunk_size=200000,   # 可調
             )
             voxel_feature_dim = voxel_features.shape[1]
+
+            if self.keep_pixel_features:
+                voxel_pixel_features = self._aggregate_full_dim_pixel_features(
+                    raw_feats=raw_feats,
+                    view_ids=view_ids,
+                    ys=ys,
+                    xs=xs,
+                    inverse_indices=inverse_indices,
+                    voxel_point_counts=voxel_point_counts,
+                    image_hw=depth.shape[-2:],
+                    device=device,
+                    chunk_size=200000,
+                )
 
         # ---------------------------------------------------
         # F. bbox
@@ -237,6 +254,7 @@ class SparseVoxelizer:
             "voxel_var_points": voxel_var_points,       # (K, 3)
             "voxel_view_counts": voxel_view_counts,     # (K,)
             "voxel_features": voxel_features,           # (K, C) or None
+            "voxel_pixel_features": voxel_pixel_features,  # (K, C_full) fp16 or None — v2 appearance head input
             "voxel_confidence": voxel_confidence,
             "num_voxels": int(num_unique),
             "num_points": int(num_points),
@@ -346,6 +364,60 @@ class SparseVoxelizer:
         voxel_counts = voxel_point_counts.unsqueeze(-1).clamp_min(1).to(torch.float32)
         voxel_features = voxel_feature_sum / voxel_counts
         return voxel_features
+
+    def _aggregate_full_dim_pixel_features(
+        self,
+        raw_feats,
+        view_ids: torch.Tensor,
+        ys: torch.Tensor,
+        xs: torch.Tensor,
+        inverse_indices: torch.Tensor,
+        voxel_point_counts: torch.Tensor,
+        image_hw: Tuple[int, int],
+        device: torch.device,
+        chunk_size: int = 200000,
+    ) -> torch.Tensor:
+        """v2 appearance path: aggregate FULL-dim DINO patch features per voxel,
+        store as fp16 to halve memory. Mirrors the truncated aggregator but skips
+        feat_dim_out and uses center patch only (neighbor_patch_radius is geometry-only)."""
+        if self.feat_mode == "last":
+            feat_tokens = raw_feats[3][0]
+        elif self.feat_mode == "last2_avg":
+            feat_tokens = 0.5 * (raw_feats[2][0] + raw_feats[3][0])
+        elif self.feat_mode == "all4_avg":
+            feat_tokens = sum(raw_feats[i][0] for i in range(4)) / 4.0
+        else:
+            raise ValueError(f"Unknown feat_mode: {self.feat_mode}")
+
+        feat_tokens = feat_tokens[0].to(device)  # [V, Ntok, C_full]
+        V, Ntok, C_full = feat_tokens.shape
+        H, W = image_hw
+        patch = self.patch_size
+        Hf, Wf = H // patch, W // patch
+        assert Ntok == Hf * Wf, f"Ntok={Ntok}, expected {Hf * Wf}"
+
+        feat_tokens = feat_tokens.to(torch.float16)
+
+        num_voxels = voxel_point_counts.shape[0]
+        # accumulate in fp32 to limit precision loss, downcast at the end
+        voxel_feature_sum = torch.zeros((num_voxels, C_full), device=device, dtype=torch.float32)
+
+        num_points = view_ids.shape[0]
+        for start in range(0, num_points, chunk_size):
+            end = min(start + chunk_size, num_points)
+            view_ids_chunk = view_ids[start:end]
+            patch_y = ys[start:end] // patch
+            patch_x = xs[start:end] // patch
+            inv_chunk = inverse_indices[start:end]
+
+            token_idx = patch_y * Wf + patch_x
+            point_feat_chunk = feat_tokens[view_ids_chunk, token_idx].to(torch.float32)
+            voxel_feature_sum.index_add_(0, inv_chunk, point_feat_chunk)
+            del view_ids_chunk, patch_y, patch_x, inv_chunk, point_feat_chunk
+
+        voxel_counts = voxel_point_counts.unsqueeze(-1).clamp_min(1).to(torch.float32)
+        voxel_pixel_features = (voxel_feature_sum / voxel_counts).to(self.pixel_feature_dtype)
+        return voxel_pixel_features
 
     def _unproject_vectorized(self, depth, K, E, mask):
         N, H, W = depth.shape

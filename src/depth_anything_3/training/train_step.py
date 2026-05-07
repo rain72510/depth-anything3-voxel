@@ -129,6 +129,9 @@ def train_one_step_on_scene(
     
     for i, view in enumerate(view_indices):
         # start = time.time()
+        extra_kwargs = {}
+        if dec_in.get("voxel_pixel_features", None) is not None:
+            extra_kwargs["voxel_pixel_features"] = dec_in["voxel_pixel_features"]
         decoder_out = decoder(
             anchor_xyz=dec_in["anchor_xyz"],
             camera_xyz=camera_xyz[view:view+1],  # select one view's camera_xyz at a time, shape [1,3]
@@ -136,6 +139,7 @@ def train_one_step_on_scene(
             confidence=dec_in["confidence"],
             cov_diag=dec_in["cov_diag"],
             voxel_colors=dec_in["voxel_colors"],
+            **extra_kwargs,
         )
         # print(f"Decoder forward pass done. Time: {time.time() - start:.2f} seconds.")
 

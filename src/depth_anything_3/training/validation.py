@@ -65,6 +65,9 @@ def verify_scene_no_cache(
     flat_scene = None
 
     for view in valid_view_indices:
+        extra_kwargs = {}
+        if decoder_inputs.get("voxel_pixel_features", None) is not None:
+            extra_kwargs["voxel_pixel_features"] = decoder_inputs["voxel_pixel_features"]
         decoder_out = decoder(
             anchor_xyz=decoder_inputs["anchor_xyz"],
             camera_xyz=camera_xyz[view:view+1],
@@ -72,6 +75,7 @@ def verify_scene_no_cache(
             confidence=decoder_inputs["confidence"],
             cov_diag=decoder_inputs["cov_diag"],
             voxel_colors=decoder_inputs["voxel_colors"],
+            **extra_kwargs,
         )
 
         pred_rgb, pred_depth, flat_scene = render_views_from_decoder_output(

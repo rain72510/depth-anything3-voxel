@@ -37,12 +37,17 @@ def build_decoder_inputs(voxel_dict: Dict[str, Any], device: torch.device) -> Di
         if voxel_colors.max() > 1.0:
             voxel_colors = voxel_colors / 255.0
 
+    voxel_pixel_features = voxel_dict.get("voxel_pixel_features", None)
+    if voxel_pixel_features is not None:
+        voxel_pixel_features = voxel_pixel_features.to(device)
+
     return {
         "anchor_xyz": anchor_xyz,   # [K, 3]
         "dino_feat": dino_feat,     # [K, C]
         "confidence": confidence,   # [K]
         "cov_diag": cov_diag,       # [K, 3]
         "voxel_colors": voxel_colors,
+        "voxel_pixel_features": voxel_pixel_features,  # [K, C_full] fp16 or None (v2 only)
     }
 
 def flatten_gaussians(out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
